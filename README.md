@@ -5,7 +5,7 @@
 2. [Download](https://github.com/michaelgoldendev/trait-evolution/archive/master.zip)'s this project's source code and extract it to a folder on your computer.
 3. Navigate to the source folder using a Windows command prompt or a Linux/Mac terminal:
 ```
-cd /path_to_messi/trait-evolution/src/
+cd /path_to_code/trait-evolution/src/
 ```
 4. Run the model using the path to your julia executable and the path of your alignment file:
 ```

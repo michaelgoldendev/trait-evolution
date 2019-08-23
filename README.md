@@ -13,4 +13,4 @@ cd /path_to_code/trait-evolution/src/
 ```
 (the above example should work out of the box)
 
-By default the model will write your results to a .csv file in the same folder as your alignment (../data/H7NX/HA/ in the example above).
+By default the model will write your results to a .csv file in the same folder as your alignment (`../data/H7NX/HA/` in the example above).

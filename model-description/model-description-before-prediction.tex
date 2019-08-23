@@ -156,9 +156,9 @@ Also note that the model is time-reversible, and therefore an unrooted tree can 
 	\caption{Contour plot of recall (blue-green-yellow colour gradient) as a function of simulated rate of trait evolution (x-axis) and simulated association strength (y-axis).}
 	\label{fig:benchmarks}%
 \end{figure}
-The Influenza H7 ML tree and corresponding HP and LP traits were taken and amino acid alignments were simulated. Each alignment consisted of 500 amino acids, with the first twenty sites of each alignment simulated as being associated with the traits, each having a different one of the 20 canonical amino acids as the target amino acid. The remaining 480 amino acid sites were simulated under the LG2008 model and were therefore treated as being independent of the traits. Three different degrees of association were simulated: weak, intermediate, and high, combined with three different rates of trait evolution (2.0, 4.0, and 7.0) - the inferred rate of trait evolution in the H7 ML tree was $\sim$4.0 and so this was selected as an intermediate value. 
+We simulated amino acid alignments using the empirical H7 AIV maximum likelihood tree and its corresponding HP and LP trait values. Each alignment consisted of 500 amino acids, with the first twenty sites of each alignment simulated as being associated with the traits, each having a different one of the 20 canonical amino acids as the target amino acid. The remaining 480 amino acid sites were simulated under the LG2008 model and were therefore treated as being independent of the traits. Three different degrees of association were simulated: weak, intermediate, and high, combined with three different rates of trait evolution (2.0, 4.0, and 7.0) - the inferred rate of trait evolution in the H7 ML tree was $\sim$4.0 and so this was selected as an intermediate value. 
 
-To account for the potential error introduced during tree inference, an ML tree was inferred using FastTree \citep{price2010fasttree}  for each of the simulated alignments. Potential associations were then estimated using our model and the Bhattacharya method \citep{bhattacharya2007founder} on the first 40 sites of each alignment. The first twenty sites were used to measure the number of true positive and false negative detections, whereas the remaining twenty sites were simulated as independent of the traits and were used to measure the number of true negative and false positive detections. The recall and precision were calculated for each simulation using the number of true positives (TN), false-positives (FP), and false-negatives (FN).  Recall and precision are defined as follows:
+To account for the potential error introduced during tree inference, an ML tree was inferred using FastTree \citep{price2010fasttree}  for each of the simulated alignments. Potential associations were then estimated using our model on the first 40 sites of each alignment. The first twenty sites were used to measure the number of true positive and false negative detections, whereas the remaining twenty sites were simulated as independent of the traits and were used to measure the number of true negative and false positive detections. The recall and precision were calculated for each simulation using the number of true positives (TN), false-positives (FP), and false-negatives (FN).  Recall and precision are defined as follows:
 \begin{equation}
 \text{Recall}=\frac{\text{TP}}{\text{TP}+\text{FN}}
 \end{equation}
@@ -167,103 +167,6 @@ To account for the potential error introduced during tree inference, an ML tree 
 \text{Precision}=\frac{\text{TP}}{\text{TP}+\text{FP}}
 \end{equation}
 The results in Table~\ref{tab:results} indicate that our model has a false-discovery rate (FDR$=100\% \times [1.0 - \text{Precision}]$) of $\sim5\%$ across all test conditions which is consistent with our p-value significance threshold of 0.05. The recall of the model increases with the simulated association strength as expected, with stronger associations being more easily detected. Likewise, the recall of the model increases with a higher rate of trait evolution (Table~\ref{tab:results} and Figure~\ref{fig:benchmarks}), which is also expected given that higher rates of trait evolution imply a greater number of trait events along the tree and therefore more the power in being able to detect an association.
-
-\subsection*{Predicting high pathogenicity}
-\begin{figure}%
-	\centering
-	\subfloat[H7 ROC curve]{{\includegraphics[width=6.50cm]{figures/H7_roc.pdf} }}%
-	\qquad
-	\subfloat[H5 ROC curve]{{\includegraphics[width=6.50cm]{figures/H5_roc.pdf} }}%
-	\caption{Receiver operating characteristic (ROC) curves for H7 and H5 training and test datasets.}%
-	\label{fig:rocprediction}%
-\end{figure}
-
-H7 and H5 mutational panels were used to construct a  predictive model of high pathogenicity (HP). This model uses the presence or absence of amino acid mutations to predict HP. For the H7 subtype there were 23 mutations selected (all H7 mutations in Table 1 and all H7 mutations with an association p-value less than 0.01), whereas for the H5 subtype there were 33 mutations selected (all H5 mutations in Table 1 and all H5 mutations with an association p-value less than 0.001). Taxa in the test and training datasets with missing segments were imputed. This was necessary because most taxa are not available as complete genomes.
-
-Python's sklearn library was used to fit two random forest classifiers, one for H7 and one for H5 subtypes, respectively. The H7 and H5 subtype alignments were used as training datasets The classifiers each used 1000 decision trees, with a maximum decision tree depth of 4.  Area Under the Curve (AUC) values of 0.868 and 0.790 were obtained for the H7 and H5 subtype test datasets, respectively (Figure~\ref{fig:rocprediction}).
-
-
-\begin{table}
-	\centering
-	\caption{\label{tab:h7panel} Mutational panel for H7 and random forest classifier importance weights for the training dataset.  Positions are those in the H6 alignment.}	
-	\small
-	\begin{tabular}{cccc}
-		\midrule
-		\textbf{Segment} & \textbf{Mutation} &  \textbf{Importance weight}\\
-		\midrule
-		HA & 143T & 0.203 \\
-		HA & 274I & 0.086 \\
-		HA & 438I & 0.017 \\
-		HA & 384N & 0.104 \\
-		HA & 402K & 0.040 \\
-		HA & 335T & 0.059 \\
-		HA & 287K & 0.014 \\
-		HA & 175G & 0.000 \\
-		HA & 152P & 0.005 \\
-		HA & 175E & 0.000 \\
-		PB1 & 154D & 0.109 \\
-		PB1 & 152L & 0.079 \\
-		PB1 & 473I & 0.044 \\
-		PB1 & 709I & 0.020 \\
-		PB2 & 355K & 0.003 \\
-		PB2 & 480I & 0.094 \\
-		PB2 & 356I & 0.005 \\
-		PB2 & 584I & 0.033 \\
-		PB2 & 640I & 0.009 \\
-		PB2 & 655A & 0.006 \\
-		PB2 & 661A & 0.003 \\
-		PB2 & 702R & 0.003 \\
-		NS1 & 56A & 0.021 \\
-		NS1 & 180T & 0.042 \\
-		\midrule
-	\end{tabular}
-\end{table}
-
-\begin{table}
-	\centering
-	\caption{\label{tab:h5panel} Mutational panel for H5 and random forest classifier importance weights for the training dataset. Positions are those in the H5 alignment.}	
-	\small
-	\begin{tabular}{cccc}
-		\midrule
-		\textbf{Segment} & \textbf{Mutation} &  \textbf{Importance weight}\\
-		\midrule
-		HA & 379R & 0.219 \\
-		HA & 242I & 0.014 \\
-		HA & 145L & 0.016 \\
-		HA & 154I & 0.016 \\
-		HA & 154L & 0.033 \\
-		HA & 127L & 0.119 \\
-		HA & 167T & 0.073 \\
-		HA & 204I & 0.061 \\
-		HA & 157P & 0.053 \\
-		HA & 214V & 0.052 \\
-		HA & 199N & 0.084 \\
-		HA & 172T & 0.008 \\
-		HA & 145A & 0.000 \\
-		HA & 145V & 0.004 \\
-		HA & 145I & 0.000 \\
-		HA & 145Q & 0.000 \\
-		HA & 145P & 0.000 \\
-		HA & 519I & 0.018 \\
-		HA & 145D & 0.000 \\
-		HA & 145T & 0.000 \\
-		HA & 170N & 0.007 \\
-		HA & 145N & 0.000 \\
-		HA & 489R & 0.008 \\
-		HA & 87V & 0.000 \\
-		HA & 149A & 0.022 \\
-		HA & 145E & 0.000 \\
-		PB1 & 113I & 0.032 \\
-		PB2 & 674T & 0.040 \\
-		PB2 & 451T & 0.027 \\
-		PB2 & 627K & 0.032 \\
-		PB2 & 508Q & 0.006 \\
-		M & 101K & 0.031 \\
-		M & 205I & 0.025 \\
-		\midrule
-	\end{tabular}
-\end{table}
-
 
 \subsection*{Software availability}
 Julia source code (compatible with Windows and Linux) is available at:\\ \href{https://github.com/michaelgoldendev/trait-evolution}{https://github.com/michaelgoldendev/trait-evolution}

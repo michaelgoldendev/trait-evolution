@@ -1,0 +1,30 @@
+\begin{thebibliography}{}
+
+\bibitem[Bhattacharya {\em et~al.}(2007)Bhattacharya, Daniels, Heckerman,
+  Foley, Frahm, Kadie, Carlson, Yusim, McMahon, Gaschen, {\em
+  et~al.}]{bhattacharya2007founder}
+Bhattacharya, T., Daniels, M., Heckerman, D., Foley, B., Frahm, N., Kadie, C.,
+  Carlson, J., Yusim, K., McMahon, B., Gaschen, B., {\em et~al.} 2007.
+\newblock Founder effects in the assessment of hiv polymorphisms and hla allele
+  associations.
+\newblock {\em Science\/}, {315}(5818): 1583--1586.
+
+\bibitem[Felsenstein(1981)Felsenstein]{felsenstein1981evolutionary}
+Felsenstein, J. 1981.
+\newblock {Evolutionary trees from {DNA} sequences: a maximum likelihood
+  approach}.
+\newblock {\em Journal of molecular evolution\/}, {17}(6): 368--376.
+
+\bibitem[Muse(1995)Muse]{muse1995evolutionary}
+Muse, S.~V. 1995.
+\newblock {Evolutionary analyses of {DNA} sequences subject to constraints of
+  secondary structure.}
+\newblock {\em Genetics\/}, {139}(3): 1429--1439.
+
+\bibitem[Price {\em et~al.}(2010)Price, Dehal, and Arkin]{price2010fasttree}
+Price, M.~N., Dehal, P.~S., and Arkin, A.~P. 2010.
+\newblock {{FastTree} 2--approximately maximum-likelihood trees for large
+  alignments}.
+\newblock {\em PloS one\/}, {5}(3): e9490.
+
+\end{thebibliography}

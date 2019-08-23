@@ -227,7 +227,7 @@ function countnodes(node::TreeNode)
     return 1
   else
     s = 0
-    for chilnode in node
+    for childnode in node
       s += countnode(childnode)
     end
     return 1+s
@@ -267,4 +267,38 @@ function countleafnodes(node::TreeNode)
     end
     return s
   end
+end
+
+export getdistance
+function getdistance(n1::TreeNode, n2::TreeNode)
+  if n1 == n2
+    return 0.0
+  end
+
+  distances1 = Float64[0.0]
+  nodes1 = TreeNode[n1]
+  while !isnull(nodes1[end].parent)
+    dist = distances1[end] + nodes1[end].branchlength
+    push!(distances1, dist)
+    push!(nodes1, get(nodes1[end].parent))
+  end
+
+  distances2 = Float64[0.0]
+  nodes2 = TreeNode[n2]
+  while !isnull(nodes2[end].parent)
+    dist = distances2[end] + nodes2[end].branchlength
+    push!(distances2, dist)
+    push!(nodes2, get(nodes2[end].parent))
+  end
+
+  dist = 0.0
+  for (d1,e1) in zip(distances1,nodes1)
+    for (d2,e2) in zip(distances2,nodes2)
+      if e1 == e2
+        dist = d1 + d2
+        break
+      end
+    end
+  end
+  return dist
 end

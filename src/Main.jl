@@ -1,20 +1,35 @@
-push!(LOAD_PATH,string(@__DIR__))
+using Pkg
+Pkg.add("Nullables")
+Pkg.add("FastaIO")
+Pkg.add("NLopt")
+Pkg.add("Formatting")
+Pkg.add("Distributions")
+Pkg.add("StatsBase")
+Pkg.add("ArgParse")
+Pkg.add("JSON")
+Pkg.add("HypothesisTests")
+Pkg.add("Random")
+Pkg.add("LinearAlgebra")
+Pkg.add("SHA")
+
+push!(LOAD_PATH,string(@__DIR__,"/MolecularEvolution/src/"))
 using MolecularEvolution
 
 push!(LOAD_PATH,@__DIR__)
 using LG
 using CommonUtils
+using CTMCs
+using Viridis
+using ChiSquaredEvolution
+
 using FastaIO
 using NLopt
 using Formatting
 using Distributions
 using StatsBase
 using ArgParse
-using CTMCs
 using JSON
-using Viridis
 using HypothesisTests
-using ChiSquaredEvolution
 using Random
 using Printf
 using Nullables

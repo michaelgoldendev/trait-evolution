@@ -60,14 +60,14 @@ function createmapping(fastafile, mappingsequence)
             for seq in sequences
                   write(outfile, string(">align1_", s, "\n"))
                   #write(outfile, seq, "\n")
-                  write(outfile, replace(seq, "-" => "N"), "\n")
+                  write(outfile, replace(seq, r"[^a-zA-Z]" => "N"), "\n")
                   s += 1
             end
             close(outfile)
 
             alignmentfile2, outfile = mktemp()
             write(outfile, ">align2_1\n")
-            write(outfile, replace(mappingsequence, "-" => "N"),"\n")
+            write(outfile, replace(mappingsequence, r"[^a-zA-Z]" => "N"),"\n")
             close(outfile)
 
             mappingalignmentmuscle, outfile = mktemp()
@@ -135,7 +135,7 @@ function createmapping2(fastafile, fastafile2)
       s = 1
       for seq in sequences
             write(outfile, string(">align1_", s, "\n"))
-            write(outfile, replace(seq, "-" => "N"), "\n")
+            write(outfile, replace(seq, r"[^a-zA-Z]" => "N"), "\n")
             s += 1
       end
       close(outfile)
@@ -158,7 +158,7 @@ function createmapping2(fastafile, fastafile2)
       s = 1
       for seq in sequences
             write(outfile, string(">align2_", s, "\n"))
-            write(outfile, replace(seq, "-" => "N"), "\n")
+            write(outfile, replace(seq, r"[^a-zA-Z]" => "N"), "\n")
             s += 1
       end
       close(outfile)
@@ -190,8 +190,8 @@ function createmapping2(fastafile, fastafile2)
       end
 
 
-      println(mapping)
-      println(revmapping)
+      #println(mapping)
+      #println(revmapping)
 
       return mapping, revmapping
 end

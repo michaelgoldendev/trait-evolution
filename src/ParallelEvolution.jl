@@ -1,5 +1,28 @@
-module TraitEvolution
-push!(LOAD_PATH,string(@__DIR__))
+using Pkg
+
+println("Installing Julia packages...")
+Pkg.add("Nullables")
+Pkg.add("FastaIO")
+Pkg.add("NLopt")
+Pkg.add("Formatting")
+Pkg.add("Distributions")
+Pkg.add("StatsBase")
+Pkg.add("ArgParse")
+Pkg.add("JSON")
+Pkg.add("HypothesisTests")
+Pkg.add("Random")
+Pkg.add("LinearAlgebra")
+Pkg.add("SHA")
+Pkg.add("Printf")
+Pkg.add("CSV")
+#Pkg.add("ROC")
+Pkg.add("Plots")
+Pkg.add("NPZ")
+println("Running...")
+
+module ParallelEvolution
+
+push!(LOAD_PATH,string(@__DIR__,"/../../MolecularEvolution/src/"))
 using MolecularEvolution
 
 push!(LOAD_PATH,@__DIR__)
@@ -45,8 +68,8 @@ function parse_commandline()
         help = "tree file to be used in Newick format"
         arg_type = String
         required = false
-        "--traits"
-        help = "a comma-seperated of traits, with the primary trait listed first, followed by the secondary trait. Traits must be present in the taxa names."
+        "--annotations"
+        help = ""
         arg_type = String
         required = true
         "--collapsetraits"
@@ -55,11 +78,14 @@ function parse_commandline()
         "--output"
         help = ""
         arg_type = String
-        default = "outfile.txt"
+        #default = "outfile.txt"
         "--mlmodel"
         help = ""
         action = :store_true
-        "--bhattacharya"
+        "--mlindelmodel"
+        help = ""
+        action = :store_true
+        "--score"
         help = ""
         action = :store_true
         "--coevolution"
@@ -74,6 +100,74 @@ function parse_commandline()
     end
 
     return parse_args(s)
+end
+
+function getIndelTmatrix(sigma::Float64, delfreq::Float64, tau::Float64, hpfreq::Float64, lambda::Float64)
+    indelfreqs = zeros(Float64,2)
+    indelfreqs[1] = delfreq
+    indelfreqs[2] = 1.0 - delfreq
+    traitfreqs = zeros(Float64,2)
+    traitfreqs[1] = hpfreq
+    traitfreqs[2] = 1.0 - hpfreq
+
+    DEL = 1
+    INS = 2
+    HP = 1
+    LP = 2
+    freqs = zeros(4)
+    for b=1:2
+        for n=1:2
+            j = (b-1)*2 + n
+            freqs[j] = indelfreqs[b]*traitfreqs[n]
+            if n == HP
+                if b == DEL
+                    freqs[j] *= lambda
+                else
+                    freqs[j] /= lambda
+                end
+            end
+        end
+    end
+    freqs /= sum(freqs)
+
+    Q = zeros(4,4)
+    for a=1:2
+        for b=1:2
+            for m=1:2
+                for n=1:2
+                    i = (a-1)*2 + m
+                    j = (b-1)*2 + n
+                    
+                    if (a != b && m == n) || (a == b && m != n)
+                        if a != b
+                            rate = indelfreqs[b]*sigma
+                        end
+                        if m != n
+                            rate = traitfreqs[n]*tau
+                        end
+
+                        if m == n && n == HP
+                            if b == DEL
+                                rate *= lambda
+                            elseif b == INS
+                                rate /= lambda
+                            end
+                        elseif a == b && n == HP
+                            if b == DEL
+                                rate *= lambda
+                            elseif b == INS
+                                rate /= lambda
+                            end
+                        end
+                        Q[i,j] = rate
+                        Q[i,i] -= rate
+                    end
+                end
+            end
+        end
+    end
+
+    return Q, freqs
 end
 
 function getTmatrix(tau::Float64, traitfreqs::Array{Float64,1})
@@ -214,6 +308,45 @@ function getaacolumn(sequences::Array{AbstractString,1}, col::Int)
     return ret
 end
 
+function getindelcolumn(sequences::Array{AbstractString,1}, col::Int)
+    ret = zeros(Int, length(sequences))
+    s = 1
+    for seq in sequences
+        if seq[col] == '-'
+            ret[s] = 0
+        else 
+            ret[s] = 1
+        end
+        s += 1
+    end
+    return ret
+end
+
+
+
+function backstack(nodelist::Array{TreeNode,1}, likelihoods::Array{Float64,2}, logm::Array{Float64,1}, initialfreqs::Array{Float64,1}, transprobs::Array{Array{Float64,2},1}, alphabet::Int)
+    backlikelihoods = copy(likelihoods)
+    backlikelihoods[1,:] = backlikelihoods[1,:].*initialfreqs
+    for node in nodelist[2:end]
+        parentindex = get(node.parent).nodeindex
+        backlikelihoods[node.nodeindex,:] = backlikelihoods[parentindex,:].*(transprobs[node.nodeindex]*likelihoods[node.nodeindex,:])
+        backlikelihoods[node.nodeindex,:] /= sum(backlikelihoods[node.nodeindex,:])
+    end
+    return backlikelihoods
+end
+
+function marginalfreqs(nodelist::Array{TreeNode,1}, likelihoods::Array{Float64,2}, logm::Array{Float64,1}, initialfreqs::Array{Float64,1}, transprobs::Array{Array{Float64,2},1}, alphabet::Int)
+    forwardliks = felsensteinstack(nodelist, likelihoods, logm, transprobs, alphabet)
+    backliks = backstack(nodelist, forwardliks, logm, initialfreqs, transprobs, alphabet)    
+    marginalfreqs = copy(forwardliks)
+    marginalfreqs[1,:] /= sum(marginalfreqs[1,:])
+    for node in nodelist[2:end]
+        marginalfreqs[node.nodeindex,:] = forwardliks[node.nodeindex,:].*backliks[node.nodeindex,:]
+        marginalfreqs[node.nodeindex,:] /= sum(marginalfreqs[node.nodeindex,:])
+    end
+    return marginalfreqs
+end
+
 function felsensteinstack(nodelist::Array{TreeNode,1}, likelihoods::Array{Float64,2}, logm::Array{Float64,1}, transprobs::Array{Array{Float64,2},1}, alphabet::Int)
 
     for node in nodelist
@@ -352,40 +485,37 @@ function optimizeaatraitmodel(datalikelihoods::Array{Float64,2},mles::Array{Floa
     opt = Opt(nloptmethod, 4)
     #localObjectiveFunction = ((param, grad) -> computesiteloglikelihoods(mles, mlparams, nodelist, data, subcolumnrefs, AATraitParameters(param), targetaa)[col])
     localObjectiveFunction = ((param, grad) -> computesiteloglikelihoodhelper(param, datalikelihoods, mles, mlparams, nodelist, data, subcolumnrefs, initialparams, targetaa, col, 100))
-    #=
-    if opt
-    localObjectiveFunction = ((param, grad) -> getaatraitcolumnloglikelihood(nodelist, likelihoods, AATraitParameters(param), targetaa))
-end=#
-lower = ones(Float64, 4)*1e-3
-upper = ones(Float64, 4)*1e3
-if targetaa == 0
-    lower[2] = 1.0
-    upper[2] = 1.0
-end
-lower[4] = 0.01
-upper[4] = 0.99
-if fixtraitparams
-    lower[3] = initialarr[3]
-    upper[3] = initialarr[3]
-    lower[4] = initialarr[4]
-    upper[4] = initialarr[4]
-end
-lower_bounds!(opt, lower)
-upper_bounds!(opt, upper)
-if mode == 1
-    xtol_rel!(opt,1e-4)
-    maxeval!(opt, maxoptiter)
-else
-    xtol_rel!(opt,1e-6)
-    maxeval!(opt, 3*maxoptiter)
-end
-max_objective!(opt, localObjectiveFunction)
-#println("B",initialarr)
-initialarr[4] = max(0.011,initialarr[4])
-initialarr[4] = min(0.989,initialarr[4])
-(maxll,maxparams,ret) = optimize(opt, initialarr)
-println("Optimal: ", maxll,"\t",maxparams)
-return maxll,maxparams
+
+    lower = ones(Float64, 4)*1e-3
+    upper = ones(Float64, 4)*1e3
+    if targetaa == 0
+        lower[2] = 1.0
+        upper[2] = 1.0
+    end
+    lower[4] = 0.01
+    upper[4] = 0.99
+    if fixtraitparams
+        lower[3] = initialarr[3]
+        upper[3] = initialarr[3]
+        lower[4] = initialarr[4]
+        upper[4] = initialarr[4]
+    end
+    lower_bounds!(opt, lower)
+    upper_bounds!(opt, upper)
+    if mode == 1
+        xtol_rel!(opt,1e-4)
+        maxeval!(opt, maxoptiter)
+    else
+        xtol_rel!(opt,1e-6)
+        maxeval!(opt, 3*maxoptiter)
+    end
+    max_objective!(opt, localObjectiveFunction)
+    #println("B",initialarr)
+    initialarr[4] = max(0.011,initialarr[4])
+    initialarr[4] = min(0.989,initialarr[4])
+    (maxll,maxparams,ret) = optimize(opt, initialarr)
+    println("Optimal: ", maxll,"\t",maxparams)
+    return maxll,maxparams
 end
 
 function optimizeaamodel(aalikelihoods::Array{Float64,2},mles::Array{Float64,2}, mlparams::Dict{Tuple{Int,Int}, AATraitParameters}, nodelist::Array{TreeNode,1}, data::Array{Float64,3}, subcolumnrefs::Array{Int,2}, initialparams::AATraitParameters, targetaa::Int, col::Int, nloptmethod::Symbol=:LN_COBYLA, fixtraitparams::Bool=false)
@@ -479,6 +609,36 @@ function getaatraitlikelihoods(nodelist::Array{TreeNode,1}, sequences::Array{Abs
     return likelihoods
 end
 
+function getindeltraitlikelihoods(nodelist::Array{TreeNode,1}, sequences::Array{AbstractString,1}, aacolumn::Array{Int,1}, traitcolumn::Array{Int,1}, seqindextonodeindex::Array{Int,1})
+    alphabet = 4
+    likelihoods = ones(length(nodelist),alphabet)*-Inf
+    for seqindex=1:length(sequences)
+        nodeindex = seqindextonodeindex[seqindex]
+        indel = 1
+        if aacolumn[seqindex] != 0
+            indel = 2
+        end
+        for a=1:alphabet
+            likelihoods[nodeindex,a] = 0.0
+        end
+        if traitcolumn[seqindex] == 0 && indel == 0
+            for a=1:alphabet
+                likelihoods[nodeindex,a] = 1.0
+            end
+        elseif traitcolumn[seqindex] == 0
+            likelihoods[nodeindex,indel] = 1.0
+            likelihoods[nodeindex,2+indel] = 1.0
+        elseif  indel == 0
+            for a=1:2
+                likelihoods[nodeindex,(traitcolumn[seqindex]-1)*2+a] = 1.0
+            end
+        else
+            likelihoods[nodeindex,(traitcolumn[seqindex]-1)*2 + indel] = 1.0
+        end
+    end
+    return likelihoods
+end
+
 function gettraitlikelihoods(nodelist::Array{TreeNode,1}, traitcolumn::Array{Int,1}, seqindextonodeindex::Array{Int,1})
     likelihoods = ones(length(nodelist),2)*-Inf
     for seqindex=1:length(traitcolumn)
@@ -497,6 +657,134 @@ function gettraitlikelihoods(nodelist::Array{TreeNode,1}, traitcolumn::Array{Int
     return likelihoods
 end
 
+function secondderiv(nodelist::Array{TreeNode,1}, likelihoods::Array{Float64,2}, params::AATraitParameters, targetaa::Int)
+    maxparams = deepcopy(params)
+    lambdas = Float64[]
+    liks = Float64[]
+    cumll = -Inf
+    cumliks = Float64[]
+    mid = 500
+    v = exp(log(100.0)/mid)
+    for i=1:1001
+        index = i - mid - 1
+        multiplier = v^index
+        #push!(lambdas, maxparams.lambda*multiplier)
+        push!(lambdas, v*multiplier)
+        tempparams = deepcopy(maxparams)
+        tempparams.lambda = lambdas[end]
+        ll = -Inf
+        try
+            ll = getaatraitcolumnloglikelihood(nodelist, likelihoods, tempparams, targetaa)
+            if i == 1
+                ll -= log(lambdas[end]-0.0)
+            else
+                ll -= log(lambdas[end]-lambdas[end-1])
+            end
+        catch
+
+        end
+        push!(liks,ll)
+        cumll = logsumexp(cumll, ll)
+        push!(cumliks,cumll)        
+      
+    end
+    cumliks = exp.(cumliks .- maximum(cumliks))
+    lower = lambdas[1]
+    upper = lambdas[end]
+    for i=1:1000
+        if cumliks[i] <= 0.025
+            lower = lambdas[i]
+        elseif cumliks[i] >= 0.975
+            upper = lambdas[i]
+            break
+        end
+    end
+    #println(lambdas)
+    println((lower,upper,1.0-cumliks[mid+1]))
+    #=   
+    maxparams = deepcopy(params)
+    h = maxparams.lambda*0.01
+    lambdas = Float64[maxparams.lambda-h, maxparams.lambda, maxparams.lambda+h]
+    liks = Float64[]
+    for lambda in lambdas
+        tempparams = deepcopy(maxparams)
+        tempparams.lambda = lambda
+        ll = getaatraitcolumnloglikelihood(nodelist, likelihoods, tempparams, targetaa)
+        push!(liks,ll)
+    end
+    deriv = (liks[3]-2.0*liks[2]+liks[1])/(h*h)
+    interval = 1.96/sqrt(-deriv)
+    println("lambdas: ", lambdas)
+    println("liks: ", liks)
+    println("sec: ", deriv,"\t", interval)
+    return interval=#
+    return (lower,upper,1.0-cumliks[mid+1])
+end
+
+function confintervalsindeltrait(nodelist::Array{TreeNode,1}, likelihoods::Array{Float64,2}, params::Array{Float64,1})
+    maxparams = deepcopy(params)
+    lambdas = Float64[]
+    liks = Float64[]
+    cumll = -Inf
+    cumliks = Float64[]
+    mid = 500
+    v = exp(log(100.0)/mid)
+    for i=1:1001
+        index = i - mid - 1
+        multiplier = v^index
+        #push!(lambdas, maxparams.lambda*multiplier)
+        push!(lambdas, v*multiplier)
+        tempparams = deepcopy(maxparams)
+        tempparams[5] = lambdas[end]
+        ll = -Inf
+        try
+            ll = getindeltraitcolumnloglikelihood(nodelist, likelihoods, tempparams)
+            if i == 1
+                ll -= log(lambdas[end]-0.0)
+            else
+                ll -= log(lambdas[end]-lambdas[end-1])
+            end
+        catch
+
+        end
+        push!(liks,ll)
+        cumll = logsumexp(cumll, ll)
+        push!(cumliks,cumll)        
+      
+    end
+    cumliks = exp.(cumliks .- maximum(cumliks))
+    lower = lambdas[1]
+    upper = lambdas[end]
+    for i=1:1000
+        if cumliks[i] <= 0.025
+            lower = lambdas[i]
+        elseif cumliks[i] >= 0.975
+            upper = lambdas[i]
+            break
+        end
+    end
+    #println(lambdas)
+    #println((lower,upper,1.0-cumliks[mid+1]))
+    #=   
+    maxparams = deepcopy(params)
+    h = maxparams.lambda*0.01
+    lambdas = Float64[maxparams.lambda-h, maxparams.lambda, maxparams.lambda+h]
+    liks = Float64[]
+    for lambda in lambdas
+        tempparams = deepcopy(maxparams)
+        tempparams.lambda = lambda
+        ll = getaatraitcolumnloglikelihood(nodelist, likelihoods, tempparams, targetaa)
+        push!(liks,ll)
+    end
+    deriv = (liks[3]-2.0*liks[2]+liks[1])/(h*h)
+    interval = 1.96/sqrt(-deriv)
+    println("lambdas: ", lambdas)
+    println("liks: ", liks)
+    println("sec: ", deriv,"\t", interval)
+    return interval=#
+    return (lower,upper,1.0-cumliks[mid+1])
+end
+
 function getaatraitcolumnloglikelihood(nodelist::Array{TreeNode,1}, likelihoods::Array{Float64,2}, params::AATraitParameters, targetaa::Int)
     alphabet = 40
     Q,freqs,marginaltraitfreqs = getAATraitmatrix(params, LGmatrix, LGfreqs, targetaa)
@@ -506,6 +794,41 @@ function getaatraitcolumnloglikelihood(nodelist::Array{TreeNode,1}, likelihoods:
     #println(totalloglikelihood,"\t",mu,"\t",lambda,"\t",tau,"\t",p,"\t",marginaltraitfreqs)
     #println(logm)
     return totalloglikelihood
+end
+
+function getindeltraitcolumnloglikelihood(nodelist::Array{TreeNode,1}, likelihoods::Array{Float64,2}, params::Array{Float64,1})
+    alphabet = 4
+    Q,freqs = getIndelTmatrix(params[1],params[2],params[3],params[4],params[5])
+    logm = zeros(Float64, size(likelihoods,1))
+    felsensteinstack(nodelist, likelihoods,logm, gettransprobmatrices(nodelist, Q), alphabet)
+    totalloglikelihood = logm[1]+log.(dot(likelihoods[1,:], freqs))
+    return totalloglikelihood
+end
+
+function optimizeindeltraitmodel(datalikelihoods::Array{Float64,2}, nodelist::Array{TreeNode,1}, nloptmethod::Symbol=:LN_COBYLA; fixlambda::Bool=false, initialparams::Array{Float64,1}=Float64[1.0, 0.2, 1.0, 0.2, 1.0])
+    global optiters
+    optiters = 0
+    maxoptiter = 1000
+    opt = Opt(nloptmethod, 5)
+    localObjectiveFunction = ((param, grad) -> getindeltraitcolumnloglikelihood(nodelist, datalikelihoods, param))
+
+    lower = ones(Float64, 5)*1e-3
+    upper = ones(Float64, 5)*1e3
+    lower[2] = 0.0
+    lower[4] = 0.0
+    upper[2] = 1.0
+    upper[4] = 1.0
+    if fixlambda
+        lower[5] = 1.0
+        upper[5] = 1.0
+    end
+    lower_bounds!(opt, lower)
+    upper_bounds!(opt, upper)
+
+    maxeval!(opt, 2000)
+    max_objective!(opt, localObjectiveFunction)
+    (maxll,maxparams,ret) = optimize(opt, initialparams)
+    return maxll,maxparams
 end
 
 function getaacolumnloglikelihood(nodelist::Array{TreeNode,1}, likelihoods::Array{Float64,2}, mu::Float64)
@@ -740,18 +1063,14 @@ function mlmodel()
     fastafile = parsed_args["alignment"]
     treefile = parsed_args["tree"]
     outfilename = parsed_args["output"]
-    if parsed_args["output"] == "outfile.txt"
-        outfilename = string(fastafile,".csv")
-    end
-    annotations = parsed_args["traits"]
+    annotations = parsed_args["annotations"]
     return mlmodel(MersenneTwister(1),fastafile,treefile,outfilename,annotations)
 end
 
 function mlmodel(rng,fastafile,treefile,outfilename,annotations,maxcols=10000000000,prioritycolumns=Int[])
     parsed_args = parse_commandline()
-
     if outfilename == nothing
-        outfilename = string(fastafile,".results.csv")
+        outfilename = string(fastafile,".results.update.csv")
     end
     zup = 1
 
@@ -763,7 +1082,7 @@ function mlmodel(rng,fastafile,treefile,outfilename,annotations,maxcols=10000000
             push!(sequences, replace(seq, "\r" => ""))
         end
     end
-
+    #println(sequences)
     numseqs = length(sequences)
     numcols = length(sequences[1])
     seqnametoindex = Dict{AbstractString,Int}()
@@ -886,6 +1205,9 @@ function mlmodel(rng,fastafile,treefile,outfilename,annotations,maxcols=10000000
     chi2lower_hponly = zeros(numcols,21,3)
     chi2medians_hponly = zeros(numcols,21,3)
     chi2upper_hponly = zeros(numcols,21,3)
+    confintlower = zeros(numcols,21)
+    confintupper = zeros(numcols,21)
+    posterior = zeros(numcols,21)
     fishertable = zeros(numcols,21,3)
     fishertable_hponly = zeros(numcols,21,3)
     initialparams = Float64[1.0,1.0,1.0,0.5]
@@ -906,7 +1228,7 @@ function mlmodel(rng,fastafile,treefile,outfilename,annotations,maxcols=10000000
     tll2 = gettraitcolumnloglikelihood(nodelist, traitlikelihoods, 7.456053451, 0.394240064)
 
     #println("a", tll1)
-   # println("b", tll2)
+    #println("b", tll2)
     p2 = AATraitParameters(Float64[31.47925915,1.0,6.040222915,0.24263616])
     p1 = AATraitParameters(Float64[31.47925915,1.0,7.456053451, 0.394240064])
     cll1 = getaatraitcolumnloglikelihood(nodelist, datalikelihoods, p2, 0)
@@ -928,6 +1250,548 @@ function mlmodel(rng,fastafile,treefile,outfilename,annotations,maxcols=10000000
     initial = optimizetraitmodel(nodelist, traitlikelihoods, initial, :LN_COBYLA)
     #println(getarray(initial))
     initialparams = getarray(initial)
+
+    
+    marginalsfile = string(outfilename,".marginals")
+    outmarginals = open(marginalsfile,"w")     
+    for z=1:zup
+        for col in columns
+            datalikelihoods = getaatraitlikelihoods(nodelist, sequences, getaacolumn(sequences, col), traits, seqindextonodeindex)
+            for targetaa=0:20
+                if performcompleteoptimisation  || (z == 1 && (targetaa == 0 || aminoacidatleaf[col, targetaa] > 0)) || (z == 2 && (targetaa != 0 && aminoacidatleaf[col, targetaa] == 0))
+                    label = string("independent\tcol: ", col)
+                    if targetaa > 0
+                        label = string("target: ", aminoacids[targetaa],"\tcol: ", col)
+                    end
+                    println(label)
+                    nloptmethod = :LN_COBYLA
+                    if targetaa == 0
+                        nloptmethod = :LN_COBYLA
+                    end
+                    #maxll,maxparams = optimizeaatraitmodel(nodelist, likelihoods, targetaa, AATraitParameters(initialparams), mode)
+                    initial = AATraitParameters(initialparams)
+                    key = (col,targetaa)
+                    if haskey(mlparams, key)
+                        initial = mlparams[key]
+                    end
+                    #maxll,maxparams = optimizeaatraitmodel(datalikelihoods,mles, mlparams, nodelist, data, subcolumnrefs, initial, targetaa, col, mode, targetaa == 0)
+                    if targetaa == 0
+                        #println("COL $(col)")
+                        temp = getaacolumn(sequences, col)
+                        aalikelihoods = getaalikelihoods(nodelist, sequences, getaacolumn(sequences, col), seqindextonodeindex)
+                        maxll,maxparams = optimizeaamodel(aalikelihoods,mles, mlparams, nodelist, data, subcolumnrefs, initial, targetaa, col, nloptmethod, targetaa == 0)
+                        initial.mu = maxparams[1]
+                        mlparams[key] = deepcopy(initial)
+                        mles[col,21] = getaatraitcolumnloglikelihood(nodelist, datalikelihoods, initial, 0)
+                        #println("HERE")
+                        #println(mlparams[key])
+                        #println(mles[col,21])
+                    end
+
+                    maxll,maxparams = optimizeaatraitmodel(datalikelihoods,mles, mlparams, nodelist, data, subcolumnrefs, initial, targetaa, col, nloptmethod, targetaa == 0)
+                    mlparams[key] = AATraitParameters(maxparams)
+                    Q, freqs, marginaltraitfreqs = getAATraitmatrix(AATraitParameters(maxparams), LGmatrix, LGfreqs, targetaa)
+                    #println(marginaltraitfreqs)
+                    if targetaa == 0
+                        mles[col,21] = maxll
+                        optimisationstatus[col,21] = 1
+                        initialparams[2:4] = maxparams[2:4]
+                        samples = backwardssampling(rng,nodelist, datalikelihoods, Q, freqs, 100)
+
+                        #ZZZZZZZ
+                        aalikelihoods = getaalikelihoods(nodelist, sequences, getaacolumn(sequences, col), seqindextonodeindex)                    
+                        logm = zeros(Float64, size(aalikelihoods,1))
+                        mu = initialparams[1]
+                        marginals = marginalfreqs(nodelist, aalikelihoods, logm, LGfreqs, gettransprobmatrices(nodelist, mu*LGmatrix), 20)
+                        targetmarginals = zeros(Float64,2,20)                        
+                        for node in nodelist
+                            if markednodes[node.nodeindex] > 0
+                                maxfreq,maxaa = findmax(marginals[node.nodeindex,:])
+                                targetmarginals[markednodes[node.nodeindex], :] += marginals[node.nodeindex,:]
+                                println(outmarginals, col,"\t",node.nodeindex,"\t", markednodes[node.nodeindex],"\t", aminoacids[maxaa],"\t",marginals[node.nodeindex,:])
+                                flush(outmarginals)
+                            end
+                        end
+                        targetmarginals[1,:] /= sum(targetmarginals[1,:])
+                        targetmarginals[2,:] /= sum(targetmarginals[2,:])
+                        println(outmarginals,"HP ", targetmarginals[1,:])
+                        println(outmarginals,"LP ", targetmarginals[2,:])
+                        print(outmarginals,"HP: ")
+                        for t=1:20
+                            if targetmarginals[1,t] > 0.001
+                                print(outmarginals,aminoacids[t], " (",@sprintf("%0.4f", targetmarginals[1,t]),");  ")
+                            end
+                        end
+                        println(outmarginals,"")
+                        print(outmarginals,"LP: ")
+                        for t=1:20
+                            if targetmarginals[2,t] > 0.001
+                                print(outmarginals,aminoacids[t], " (",@sprintf("%0.4f", targetmarginals[2,t]),");  ")
+                            end
+                        end
+                        println(outmarginals,"")
+
+                        for t=1:20
+                            chi2medians[col,t,1], chi2lower[col,t,1], chi2upper[col,t,1], chi2medians[col,t,2], chi2lower[col,t,2], chi2upper[col,t,2],  chi2medians[col,t,3], chi2lower[col,t,3],  chi2upper[col,t,3], fishertable[col,t,1],fishertable[col,t,2],fishertable[col,t,3] = chisquaredtest(nodelist, markednodes, traits, samples, t, true)
+                            chi2medians_hponly[col,t,1], chi2lower_hponly[col,t,1], chi2upper_hponly[col,t,1], chi2medians_hponly[col,t,2], chi2lower_hponly[col,t,2], chi2upper_hponly[col,t,2],  chi2medians_hponly[col,t,3], chi2lower_hponly[col,t,3], chi2upper_hponly[col,t,3], fishertable_hponly[col,t,1], fishertable_hponly[col,t,2], fishertable_hponly[col,t,3]  = chisquaredtest(nodelist, markednodes, traits, samples, t, false)
+                        end
+                        for t=1:20
+                            if mles[col,21] > mles[col,t]
+                                mles[col,t] = mles[col,21]
+                                mlparams[(col,t)] = mlparams[key]
+                            end
+                        end
+                    else
+                        optimisationstatus[col,targetaa] = 1
+                        mles[col,targetaa] = maxll
+                        D = 2.0*(mles[col,targetaa]-mles[col,21])
+                        #println("chi2=",@sprintf("%0.2f", D),"\tpval=",ccdf(Chisq(1), D))
+
+                        #println("AAA: ",mlparams[(col,targetaa)])
+                        confintlower[col,targetaa], confintupper[col,targetaa], posterior[col,targetaa] = secondderiv(nodelist,datalikelihoods,mlparams[(col,targetaa)],targetaa)
+                    end
+                    if targetaa == 0
+                        initialparams = copy(maxparams)
+                    end
+                end
+            end
+
+            #println(abspath(outfilename))
+            #exit()
+            outfile = open(outfilename,"w")       
+            #println(outfile,"\"Site\",\"Target AA\",\"Count at leaf\",\"mu\",\"tau\",\"p\",\"lambda\",\"Optimisation\",\"MLL\",\"AIC\",\"chi2\",\"pvalue\",\"X->notX vs X->X\",\"Fisher's pvalue\",\"lower\",\"upper\",\"notX->notX vs notX->X\",\"Fisher's pvalue\",\"lower\",\"upper\",\"notX vs X\",\"Fisher's pvalue\",\"lower\",\"upper\",\"X->notX vs X->X\",\"Fisher's pvalue\",\"lower\",\"upper\",\"notX->notX vs notX->X\",\"Fisher's pvalue\",\"lower\",\"upper\",\"notX vs X\",\"Fisher's pvalue\",\"lower\",\"upper\"")
+            println(outfile,"\"Site\",\"Target AA\",\"Count at leaf\",\"mu\",\"tau\",\"p\",\"lambda\",\"lower 2.5%\",\"upper 2.5%\",\"posterior\",\"Optimisation\",\"MLL\",\"AIC\",\"chi2\",\"pvalue\",\"X->notX vs X->X\",\"pvalue\",\"lower\",\"upper\",\"notX->notX vs notX->X\",\"pvalue\",\"lower\",\"upper\",\"notX vs X\",\"pvalue\",\"lower\",\"upper\",\"X->notX vs X->X\",\"pvalue\",\"lower\",\"upper\",\"notX->notX vs notX->X\",\"pvalue\",\"lower\",\"upper\",\"notX vs X\",\"pvalue\",\"lower\",\"upper\"")
+            for c=1:numcols
+                if optimisationstatus[c,21] == 1
+                    for t=0:20
+                        key = (c,t)
+                        if haskey(mlparams, key)
+                            params = mlparams[key]
+                            if t == 0
+                                optstatuslabel = "Partial"
+                                if optimisationstatus[c,21] == 1
+                                    optstatuslabel = "Complete"
+                                end
+                                D = 0.0
+                                aic = 2.0*3.0 - 2.0*mles[c,21]
+                               # println(outfile,c,",", "independent,","-,", params.mu, ",",  params.tau, ",",  params.p, ",", params.lambda, ",",optstatuslabel, ",",mles[c,21], ",",aic, ",", "0.0", ",", "1.0", ",0.0,1.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,1.0,0.0,0.0")
+                                println(outfile,c,",", "independent,","-,", params.mu, ",",  params.tau, ",",  params.p, ",", params.lambda,",-",",-",",0.5", ",",optstatuslabel, ",",mles[c,21], ",",aic, ",", "0.0", ",", "1.0", ",0.0,1.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,1.0,0.0,0.0")
+                            else
+                                optstatuslabel = "Partial"
+                                if optimisationstatus[c,t] == 1
+                                    optstatuslabel = "Complete"
+                                end
+                                D = 2.0*(mles[c,t]-mles[c,21])
+                                pval = chi2pval(D,1)
+                                if params.lambda < 1.0
+                                    D = -D
+                                end
+                                aic = 2.0*4.0 - 2.0*mles[c,t]
+                                #println(outfile,c,",", aminoacids[t],",",aminoacidatleaf[c,t],",", params.mu, ",",  params.tau, ",",  params.p, ",", params.lambda, ",",optstatuslabel,",",mles[c,t],",",aic, ",", D, ",", pval, ",", chi2medians_hponly[c,t,1], ",", fishertable_hponly[col,t,1], ",", chi2lower_hponly[c,t,1], ",", chi2upper_hponly[c,t,1], ",", chi2medians_hponly[c,t,2], ",", fishertable_hponly[col,t,2], ",", chi2lower_hponly[c,t,2], ",", chi2upper_hponly[c,t,2], ",", chi2medians_hponly[c,t,3], ",", fishertable_hponly[col,t,3], ",", chi2lower_hponly[c,t,3], ",", chi2upper_hponly[c,t,3], ",", chi2medians[c,t,1], ",", fishertable[col,t,1], ",", chi2lower[c,t,1], ",", chi2upper[c,t,1], ",", chi2medians[c,t,2], ",", fishertable[col,t,2], ",", chi2lower[c,t,2], ",", chi2upper[c,t,2], ",", chi2medians[c,t,3], ",", fishertable[col,t,3], ",", chi2lower[c,t,3], ",", chi2upper[c,t,3])
+                                
+                               # println(outfile,c,",", aminoacids[t],",",aminoacidatleaf[c,t],",", params.mu, ",",  params.tau, ",",  params.p, ",", params.lambda, ",",optstatuslabel,",",mles[c,t],",",aic, ",", D, ",", pval, ",", chi2medians_hponly[c,t,1], ",", ccdf(Chisq(1), abs(chi2medians_hponly[c,t,1])), ",", chi2lower_hponly[c,t,1], ",", chi2upper_hponly[c,t,1], ",", chi2medians_hponly[c,t,2], ",", ccdf(Chisq(1), abs(chi2medians_hponly[c,t,2])), ",", chi2lower_hponly[c,t,2], ",", chi2upper_hponly[c,t,2], ",", chi2medians_hponly[c,t,3], ",", ccdf(Chisq(1), abs(chi2medians_hponly[c,t,3])), ",", chi2lower_hponly[c,t,3], ",", chi2upper_hponly[c,t,3], ",", chi2medians[c,t,1], ",", ccdf(Chisq(1), abs(chi2medians[c,t,1])), ",", chi2lower[c,t,1], ",", chi2upper[c,t,1], ",", chi2medians[c,t,2], ",", ccdf(Chisq(1), abs(chi2medians[c,t,2])), ",", chi2lower[c,t,2], ",", chi2upper[c,t,2], ",", chi2medians[c,t,3], ",", ccdf(Chisq(1), abs(chi2medians[c,t,3])), ",", chi2lower[c,t,3], ",", chi2upper[c,t,3])
+                                if confintlower[c,t] == confintupper[c,t] == posterior[c,t] == 0.0
+                                    println(outfile,c,",", aminoacids[t],",",aminoacidatleaf[c,t],",", params.mu, ",",  params.tau, ",",  params.p, ",", params.lambda,",","-",",","-",",","0.5", ",",optstatuslabel,",",mles[c,t],",",aic, ",", D, ",", pval, ",", chi2medians_hponly[c,t,1], ",", ccdf(Chisq(1), abs(chi2medians_hponly[c,t,1])), ",", chi2lower_hponly[c,t,1], ",", chi2upper_hponly[c,t,1], ",", chi2medians_hponly[c,t,2], ",", ccdf(Chisq(1), abs(chi2medians_hponly[c,t,2])), ",", chi2lower_hponly[c,t,2], ",", chi2upper_hponly[c,t,2], ",", chi2medians_hponly[c,t,3], ",", ccdf(Chisq(1), abs(chi2medians_hponly[c,t,3])), ",", chi2lower_hponly[c,t,3], ",", chi2upper_hponly[c,t,3], ",", chi2medians[c,t,1], ",", ccdf(Chisq(1), abs(chi2medians[c,t,1])), ",", chi2lower[c,t,1], ",", chi2upper[c,t,1], ",", chi2medians[c,t,2], ",", ccdf(Chisq(1), abs(chi2medians[c,t,2])), ",", chi2lower[c,t,2], ",", chi2upper[c,t,2], ",", chi2medians[c,t,3], ",", ccdf(Chisq(1), abs(chi2medians[c,t,3])), ",", chi2lower[c,t,3], ",", chi2upper[c,t,3])
+                                else
+                                    println(outfile,c,",", aminoacids[t],",",aminoacidatleaf[c,t],",", params.mu, ",",  params.tau, ",",  params.p, ",", params.lambda,",",confintlower[c,t],",",confintupper[c,t],",",posterior[c,t], ",",optstatuslabel,",",mles[c,t],",",aic, ",", D, ",", pval, ",", chi2medians_hponly[c,t,1], ",", ccdf(Chisq(1), abs(chi2medians_hponly[c,t,1])), ",", chi2lower_hponly[c,t,1], ",", chi2upper_hponly[c,t,1], ",", chi2medians_hponly[c,t,2], ",", ccdf(Chisq(1), abs(chi2medians_hponly[c,t,2])), ",", chi2lower_hponly[c,t,2], ",", chi2upper_hponly[c,t,2], ",", chi2medians_hponly[c,t,3], ",", ccdf(Chisq(1), abs(chi2medians_hponly[c,t,3])), ",", chi2lower_hponly[c,t,3], ",", chi2upper_hponly[c,t,3], ",", chi2medians[c,t,1], ",", ccdf(Chisq(1), abs(chi2medians[c,t,1])), ",", chi2lower[c,t,1], ",", chi2upper[c,t,1], ",", chi2medians[c,t,2], ",", ccdf(Chisq(1), abs(chi2medians[c,t,2])), ",", chi2lower[c,t,2], ",", chi2upper[c,t,2], ",", chi2medians[c,t,3], ",", ccdf(Chisq(1), abs(chi2medians[c,t,3])), ",", chi2lower[c,t,3], ",", chi2upper[c,t,3])
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+            close(outfile)
+        end
+    end
+end
+
+function mlindelmodel()
+    parsed_args = parse_commandline()
+    fastafile = parsed_args["alignment"]
+    treefile = parsed_args["tree"]
+    outfilename = parsed_args["output"]
+    annotations = parsed_args["annotations"]
+    return mlindelmodel(MersenneTwister(1),fastafile,treefile,outfilename,annotations)
+end
+
+function mlindelmodel(rng,fastafile,treefile,outfilename,annotations,maxcols=10000000000,prioritycolumns=Int[])
+    parsed_args = parse_commandline()
+    if outfilename == nothing
+        outfilename = string(fastafile,".results.update.csv")
+    end
+    zup = 1
+
+    sequences = AbstractString[]
+    names = AbstractString[]
+    FastaIO.FastaReader(fastafile) do fr
+        for (desc, seq) in fr
+            push!(names, replace(strip(desc), "\\r" => ""))
+            push!(sequences, replace(seq, "\r" => ""))
+        end
+    end
+    #println(sequences)
+    numseqs = length(sequences)
+    numcols = length(sequences[1])
+    seqnametoindex = Dict{AbstractString,Int}()
+    len = 0
+    seqindex = 1
+    for (taxon,sequence) in zip(names, sequences)
+        len = length(sequence)
+        seqnametoindex[taxon] = seqindex
+        seqindex += 1
+    end
+    annotationnames = split(annotations,",")
+
+    traits = Int[]
+    for name in names
+        match = false
+        for annotationindex=1:length(annotationnames)
+            if occursin(annotationnames[annotationindex], name)
+                push!(traits,annotationindex)
+                match = true
+                break
+            end
+        end
+        if !match
+            push!(traits,0)
+        end
+    end
+    #println(traits)
+
+    nodelist = loadtree(treefile)
+    for node in nodelist
+        if node.branchlength <= 1e-7
+            node.branchlength = 1e-7
+        end
+    end
+    seqnametonodeindex = Dict{AbstractString,Int}()
+    nodeindex = 1
+    for node in nodelist
+        node.nodeindex = nodeindex
+        if node.name != ""
+            seqnametonodeindex[node.name] = node.nodeindex
+        else
+            node.name = string("[",node.nodeindex,"]")
+        end
+        nodeindex += 1
+    end
+    seqindextonodeindex = zeros(Int,length(sequences))
+    seqindex = 1
+    for (taxon,sequence) in zip(names, sequences)
+        seqindextonodeindex[seqindex] = seqnametonodeindex[taxon]
+        nodelist[seqnametonodeindex[taxon]].seqindex = seqindex
+        seqindex += 1
+    end
+    data,subcolumnrefs = getaatraitdata(nodelist,seqindextonodeindex,sequences, traits)
+
+
+    #performchi2association(string(fastafile,".chi2.csv"), sequences, traits, annotationnames)
+
+    markednodes = zeros(Int,length(nodelist))
+    traitcounts = ones(Int, length(nodelist), 2)*-1
+    stack = Int[1]
+    while length(stack) > 0
+        nodeindex = stack[end]
+        currentnode = nodelist[nodeindex]
+        if isleafnode(currentnode)
+            trait = traits[seqnametoindex[currentnode.name]]
+            for a=1:size(traitcounts,2)
+                traitcounts[nodeindex,a] = 0
+            end
+            if trait > 0
+                traitcounts[nodeindex, trait] = 1
+            end
+            pop!(stack)
+        else
+            cont = true
+            for child in currentnode.children
+                if traitcounts[child.nodeindex,1] == -1
+                    push!(stack, child.nodeindex)
+                    cont = false
+                end
+            end
+            if cont
+                for a=1:size(traitcounts,2)
+                    traitcounts[nodeindex,a] = 0
+                end
+                for child in currentnode.children
+                    traitcounts[nodeindex,:] += traitcounts[child.nodeindex,:]
+                end
+                pop!(stack)
+            end
+        end
+    end
+    for i=1:length(nodelist)
+        nodeindex = nodelist[i].nodeindex
+        parentnode = nodelist[i].parent
+        parentindex = 0
+        if !isnull(parentnode)
+            parentindex = get(parentnode).nodeindex
+        end
+        if !(parentindex == 0 || maximum(traitcounts[parentindex,:]) == sum(traitcounts[parentindex,:])) && maximum(traitcounts[nodeindex,:]) == sum(traitcounts[nodeindex,:])
+            markednodes[nodeindex] = argmax(traitcounts[nodeindex,:])
+        end
+    end
+
+
+    columns = Int[]
+    append!(columns, prioritycolumns)
+    for c=1:min(numcols,maxcols)
+        if !in(c,columns)
+            push!(columns,c)
+        end
+    end
+
+    mles = ones(Float64,numcols,21)*-Inf
+    optimisationstatus = zeros(Int,numcols,21)
+    performcompleteoptimisation = false
+    mlparams = Dict{Tuple{Int,Int}, AATraitParameters}()
+    chi2lower = zeros(numcols,21,3)
+    chi2medians = zeros(numcols,21,3)
+    chi2upper = zeros(numcols,21,3)
+    chi2lower_hponly = zeros(numcols,21,3)
+    chi2medians_hponly = zeros(numcols,21,3)
+    chi2upper_hponly = zeros(numcols,21,3)
+    confintlower = zeros(numcols,21)
+    confintupper = zeros(numcols,21)
+    posterior = zeros(numcols,21)
+    fishertable = zeros(numcols,21,3)
+    fishertable_hponly = zeros(numcols,21,3)
+    initialparams = Float64[1.0,1.0,1.0,0.5]
+    aminoacidatleaf = zeros(Int,numcols,20)
+    for col=1:numcols
+        ret = getaacolumn(sequences, col)
+        for s=1:size(ret,1)
+            if ret[s] > 0
+                aminoacidatleaf[col,ret[s]] += 1
+            end
+        end
+    end
+
+    startindex = 1
+    endindex = length(sequences[1])
+    startindex = 145
+    endindex = 145
+    for col=startindex:endindex
+        initialparams = Float64[1.0,0.2,1.0,0.2,1.0]
+        if in(0, getindelcolumn(sequences, col))      
+            datalikelihoods = getindeltraitlikelihoods(nodelist, sequences, getindelcolumn(sequences, col), traits, seqindextonodeindex)
+            likelihood = getindeltraitcolumnloglikelihood(nodelist, datalikelihoods, initialparams)
+            maxll1, initialparams = optimizeindeltraitmodel(datalikelihoods, nodelist,fixlambda=true,initialparams=initialparams)
+            maxll2, maxparams = optimizeindeltraitmodel(datalikelihoods, nodelist,fixlambda=false,initialparams=initialparams)
+            lower,upper,posterior = confintervalsindeltrait(nodelist,datalikelihoods,maxparams)
+            println(col,"\t", chi2pval(2.0*(maxll2-maxll1),1), "\t",maxll1,"\t",maxll2,"\t",maxparams[5],"\t",lower,"\t",upper,"\t",posterior)
+            Q,freqs = getIndelTmatrix(maxparams[1], maxparams[2], maxparams[3], maxparams[4], maxparams[5])        
+        end
+    end
+end
+
+function score()
+    parsed_args = parse_commandline()
+    fastafile = parsed_args["alignment"]
+    treefile = parsed_args["tree"]
+    outfilename = parsed_args["output"]
+    annotations = parsed_args["annotations"]
+    return score(MersenneTwister(1),fastafile,treefile,outfilename,annotations)
+end
+
+function score(rng,fastafile,treefile,outfilename,annotations,maxcols=10000000000,prioritycolumns=Int[])
+    parsed_args = parse_commandline()
+
+    if outfilename == nothing
+        outfilename = string(fastafile,".results.update.csv")
+    end
+    zup = 1
+
+    sequences = AbstractString[]
+    names = AbstractString[]
+    FastaIO.FastaReader(fastafile) do fr
+        for (desc, seq) in fr
+            push!(names, replace(strip(desc), "\\r" => ""))
+            push!(sequences, replace(seq, "\r" => ""))
+        end
+    end
+    println(sequences)
+    numseqs = length(sequences)
+    numcols = length(sequences[1])
+    seqnametoindex = Dict{AbstractString,Int}()
+    len = 0
+    seqindex = 1
+    for (taxon,sequence) in zip(names, sequences)
+        len = length(sequence)
+        seqnametoindex[taxon] = seqindex
+        seqindex += 1
+    end
+    annotationnames = split(annotations,",")
+
+    traits = Int[]
+    for name in names
+        match = false
+        for annotationindex=1:length(annotationnames)
+            if occursin(annotationnames[annotationindex], name)
+                push!(traits,annotationindex)
+                match = true
+                break
+            end
+        end
+        if !match
+            push!(traits,0)
+        end
+    end
+    println(traits)
+
+    nodelist = loadtree(treefile)
+    for node in nodelist
+        if node.branchlength <= 1e-7
+            node.branchlength = 1e-7
+        end
+    end
+    seqnametonodeindex = Dict{AbstractString,Int}()
+    nodeindex = 1
+    for node in nodelist
+        node.nodeindex = nodeindex
+        if node.name != ""
+            seqnametonodeindex[node.name] = node.nodeindex
+        else
+            node.name = string("[",node.nodeindex,"]")
+        end
+        nodeindex += 1
+    end
+    seqindextonodeindex = zeros(Int,length(sequences))
+    seqindex = 1
+    for (taxon,sequence) in zip(names, sequences)
+        seqindextonodeindex[seqindex] = seqnametonodeindex[taxon]
+        nodelist[seqnametonodeindex[taxon]].seqindex = seqindex
+        seqindex += 1
+    end
+    data,subcolumnrefs = getaatraitdata(nodelist,seqindextonodeindex,sequences, traits)
+
+
+    #performchi2association(string(fastafile,".chi2.csv"), sequences, traits, annotationnames)
+
+    markednodes = zeros(Int,length(nodelist))
+    traitcounts = ones(Int, length(nodelist), 2)*-1
+    stack = Int[1]
+    while length(stack) > 0
+        nodeindex = stack[end]
+        currentnode = nodelist[nodeindex]
+        if isleafnode(currentnode)
+            trait = traits[seqnametoindex[currentnode.name]]
+            for a=1:size(traitcounts,2)
+                traitcounts[nodeindex,a] = 0
+            end
+            if trait > 0
+                traitcounts[nodeindex, trait] = 1
+            end
+            pop!(stack)
+        else
+            cont = true
+            for child in currentnode.children
+                if traitcounts[child.nodeindex,1] == -1
+                    push!(stack, child.nodeindex)
+                    cont = false
+                end
+            end
+            if cont
+                for a=1:size(traitcounts,2)
+                    traitcounts[nodeindex,a] = 0
+                end
+                for child in currentnode.children
+                    traitcounts[nodeindex,:] += traitcounts[child.nodeindex,:]
+                end
+                pop!(stack)
+            end
+        end
+    end
+    for i=1:length(nodelist)
+        nodeindex = nodelist[i].nodeindex
+        parentnode = nodelist[i].parent
+        parentindex = 0
+        if !isnull(parentnode)
+            parentindex = get(parentnode).nodeindex
+        end
+        if !(parentindex == 0 || maximum(traitcounts[parentindex,:]) == sum(traitcounts[parentindex,:])) && maximum(traitcounts[nodeindex,:]) == sum(traitcounts[nodeindex,:])
+            markednodes[nodeindex] = argmax(traitcounts[nodeindex,:])
+        end
+    end
+
+
+    columns = Int[]
+    append!(columns, prioritycolumns)
+    for c=1:min(numcols,maxcols)
+        if !in(c,columns)
+            push!(columns,c)
+        end
+    end
+
+    mles = ones(Float64,numcols,21)*-Inf
+    optimisationstatus = zeros(Int,numcols,21)
+    performcompleteoptimisation = false
+    mlparams = Dict{Tuple{Int,Int}, AATraitParameters}()
+    chi2lower = zeros(numcols,21,3)
+    chi2medians = zeros(numcols,21,3)
+    chi2upper = zeros(numcols,21,3)
+    chi2lower_hponly = zeros(numcols,21,3)
+    chi2medians_hponly = zeros(numcols,21,3)
+    chi2upper_hponly = zeros(numcols,21,3)
+    confintlower = zeros(numcols,21)
+    confintupper = zeros(numcols,21)
+    posterior = zeros(numcols,21)
+    fishertable = zeros(numcols,21,3)
+    fishertable_hponly = zeros(numcols,21,3)
+    initialparams = Float64[1.0,1.0,1.0,0.5]
+    aminoacidatleaf = zeros(Int,numcols,20)
+    for col=1:numcols
+        ret = getaacolumn(sequences, col)
+        for s=1:size(ret,1)
+            if ret[s] > 0
+                aminoacidatleaf[col,ret[s]] += 1
+            end
+        end
+    end
+
+    datalikelihoods = getaatraitlikelihoods(nodelist, sequences, getaacolumn(sequences, 143), traits, seqindextonodeindex)
+    aalikelihoods = getaalikelihoods(nodelist, sequences, getaacolumn(sequences, 143), seqindextonodeindex)
+    traitlikelihoods = gettraitlikelihoods(nodelist, traits, seqindextonodeindex)
+    tll1 = gettraitcolumnloglikelihood(nodelist, traitlikelihoods, 6.040222915, 0.24263616)
+    tll2 = gettraitcolumnloglikelihood(nodelist, traitlikelihoods, 7.456053451, 0.394240064)
+
+    println("a", tll1)
+    println("b", tll2)
+    p2 = AATraitParameters(Float64[31.47925915,1.0,6.040222915,0.24263616])
+    p1 = AATraitParameters(Float64[31.47925915,1.0,7.456053451, 0.394240064])
+    cll1 = getaatraitcolumnloglikelihood(nodelist, datalikelihoods, p2, 0)
+    cll2 = getaatraitcolumnloglikelihood(nodelist, datalikelihoods, p1, 0)
+    aall = getaacolumnloglikelihood(nodelist,aalikelihoods, 31.47925915)
+    println("e",aall)
+    println("c",cll1,"\t", tll1+aall, "\t",tll1+aall-cll1)
+    println("d",cll2,"\t", tll2+aall, "\t",tll2+aall-cll2)
+    println(tll1-tll2)
+    println(cll1-cll2)
+
+    #initial = AATraitParameters(initialparams)
+    initial = deepcopy(p1)
+    println(getarray(initial))
+    initial = optimizetraitmodel(nodelist, traitlikelihoods, initial, :GN_DIRECT)
+    println(getarray(initial))
+    initial = optimizetraitmodel(nodelist, traitlikelihoods, initial, :GN_CRS2_LM)
+    println(getarray(initial))
+    initial = optimizetraitmodel(nodelist, traitlikelihoods, initial, :LN_COBYLA)
+    println(getarray(initial))
+    initialparams = getarray(initial)
+
+    logm = zeros(Float64, size(aalikelihoods,1))
+    mu = initialparams[1]
+    freqs = marginalfreqs(nodelist, aalikelihoods, logm, LGfreqs, gettransprobmatrices(nodelist, mu*LGmatrix), 20)
+    for node in nodelist
+        println(node.nodeindex,"\t",freqs[node.nodeindex,:])
+    end
+    
+    #felsensteinstack(nodelist, aalikelihoods,logm, gettransprobmatrices(nodelist, mu*LGmatrix), 20)
+    #totalloglikelihood = logm[1]+log.(dot(aalikelihoods[1,:], LGfreqs))
+    #println(aalikelihoods[1,:]/sum(aalikelihoods[1,:]))
+
+    #=
     for z=1:zup
         for col in columns
             datalikelihoods = getaatraitlikelihoods(nodelist, sequences, getaacolumn(sequences, col), traits, seqindextonodeindex)
@@ -986,6 +1850,9 @@ function mlmodel(rng,fastafile,treefile,outfilename,annotations,maxcols=10000000
                         mles[col,targetaa] = maxll
                         D = 2.0*(mles[col,targetaa]-mles[col,21])
                         #println("chi2=",@sprintf("%0.2f", D),"\tpval=",ccdf(Chisq(1), D))
+
+                        println("AAA: ",mlparams[(col,targetaa)])
+                        confintlower[col,targetaa], confintupper[col,targetaa], posterior[col,targetaa] = secondderiv(nodelist,datalikelihoods,mlparams[(col,targetaa)],targetaa)
                     end
                     if targetaa == 0
                         initialparams = copy(maxparams)
@@ -997,7 +1864,7 @@ function mlmodel(rng,fastafile,treefile,outfilename,annotations,maxcols=10000000
             #exit()
             outfile = open(outfilename,"w")
             #println(outfile,"\"Site\",\"Target AA\",\"Count at leaf\",\"mu\",\"tau\",\"p\",\"lambda\",\"Optimisation\",\"MLL\",\"AIC\",\"chi2\",\"pvalue\",\"X->notX vs X->X\",\"Fisher's pvalue\",\"lower\",\"upper\",\"notX->notX vs notX->X\",\"Fisher's pvalue\",\"lower\",\"upper\",\"notX vs X\",\"Fisher's pvalue\",\"lower\",\"upper\",\"X->notX vs X->X\",\"Fisher's pvalue\",\"lower\",\"upper\",\"notX->notX vs notX->X\",\"Fisher's pvalue\",\"lower\",\"upper\",\"notX vs X\",\"Fisher's pvalue\",\"lower\",\"upper\"")
-            println(outfile,"\"Site\",\"Target AA\",\"Count at leaf\",\"mu\",\"tau\",\"p\",\"lambda\",\"Optimisation\",\"MLL\",\"AIC\",\"chi2\",\"pvalue\",\"X->notX vs X->X\",\"pvalue\",\"lower\",\"upper\",\"notX->notX vs notX->X\",\"pvalue\",\"lower\",\"upper\",\"notX vs X\",\"pvalue\",\"lower\",\"upper\",\"X->notX vs X->X\",\"pvalue\",\"lower\",\"upper\",\"notX->notX vs notX->X\",\"pvalue\",\"lower\",\"upper\",\"notX vs X\",\"pvalue\",\"lower\",\"upper\"")
+            println(outfile,"\"Site\",\"Target AA\",\"Count at leaf\",\"mu\",\"tau\",\"p\",\"lambda\",\"lower 2.5%\",\"upper 2.5%\",\"posterior\",\"Optimisation\",\"MLL\",\"AIC\",\"chi2\",\"pvalue\",\"X->notX vs X->X\",\"pvalue\",\"lower\",\"upper\",\"notX->notX vs notX->X\",\"pvalue\",\"lower\",\"upper\",\"notX vs X\",\"pvalue\",\"lower\",\"upper\",\"X->notX vs X->X\",\"pvalue\",\"lower\",\"upper\",\"notX->notX vs notX->X\",\"pvalue\",\"lower\",\"upper\",\"notX vs X\",\"pvalue\",\"lower\",\"upper\"")
             for c=1:numcols
                 if optimisationstatus[c,21] == 1
                     for t=0:20
@@ -1011,7 +1878,8 @@ function mlmodel(rng,fastafile,treefile,outfilename,annotations,maxcols=10000000
                                 end
                                 D = 0.0
                                 aic = 2.0*3.0 - 2.0*mles[c,21]
-                                println(outfile,c,",", "independent,","-,", params.mu, ",",  params.tau, ",",  params.p, ",", params.lambda, ",",optstatuslabel, ",",mles[c,21], ",",aic, ",", "0.0", ",", "1.0", ",0.0,1.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,1.0,0.0,0.0")
+                               # println(outfile,c,",", "independent,","-,", params.mu, ",",  params.tau, ",",  params.p, ",", params.lambda, ",",optstatuslabel, ",",mles[c,21], ",",aic, ",", "0.0", ",", "1.0", ",0.0,1.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,1.0,0.0,0.0")
+                                println(outfile,c,",", "independent,","-,", params.mu, ",",  params.tau, ",",  params.p, ",", params.lambda,",-",",-",",0.5", ",",optstatuslabel, ",",mles[c,21], ",",aic, ",", "0.0", ",", "1.0", ",0.0,1.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,1.0,0.0,0.0")
                             else
                                 optstatuslabel = "Partial"
                                 if optimisationstatus[c,t] == 1
@@ -1024,8 +1892,13 @@ function mlmodel(rng,fastafile,treefile,outfilename,annotations,maxcols=10000000
                                 end
                                 aic = 2.0*4.0 - 2.0*mles[c,t]
                                 #println(outfile,c,",", aminoacids[t],",",aminoacidatleaf[c,t],",", params.mu, ",",  params.tau, ",",  params.p, ",", params.lambda, ",",optstatuslabel,",",mles[c,t],",",aic, ",", D, ",", pval, ",", chi2medians_hponly[c,t,1], ",", fishertable_hponly[col,t,1], ",", chi2lower_hponly[c,t,1], ",", chi2upper_hponly[c,t,1], ",", chi2medians_hponly[c,t,2], ",", fishertable_hponly[col,t,2], ",", chi2lower_hponly[c,t,2], ",", chi2upper_hponly[c,t,2], ",", chi2medians_hponly[c,t,3], ",", fishertable_hponly[col,t,3], ",", chi2lower_hponly[c,t,3], ",", chi2upper_hponly[c,t,3], ",", chi2medians[c,t,1], ",", fishertable[col,t,1], ",", chi2lower[c,t,1], ",", chi2upper[c,t,1], ",", chi2medians[c,t,2], ",", fishertable[col,t,2], ",", chi2lower[c,t,2], ",", chi2upper[c,t,2], ",", chi2medians[c,t,3], ",", fishertable[col,t,3], ",", chi2lower[c,t,3], ",", chi2upper[c,t,3])
-
-                                println(outfile,c,",", aminoacids[t],",",aminoacidatleaf[c,t],",", params.mu, ",",  params.tau, ",",  params.p, ",", params.lambda, ",",optstatuslabel,",",mles[c,t],",",aic, ",", D, ",", pval, ",", chi2medians_hponly[c,t,1], ",", ccdf(Chisq(1), abs(chi2medians_hponly[c,t,1])), ",", chi2lower_hponly[c,t,1], ",", chi2upper_hponly[c,t,1], ",", chi2medians_hponly[c,t,2], ",", ccdf(Chisq(1), abs(chi2medians_hponly[c,t,2])), ",", chi2lower_hponly[c,t,2], ",", chi2upper_hponly[c,t,2], ",", chi2medians_hponly[c,t,3], ",", ccdf(Chisq(1), abs(chi2medians_hponly[c,t,3])), ",", chi2lower_hponly[c,t,3], ",", chi2upper_hponly[c,t,3], ",", chi2medians[c,t,1], ",", ccdf(Chisq(1), abs(chi2medians[c,t,1])), ",", chi2lower[c,t,1], ",", chi2upper[c,t,1], ",", chi2medians[c,t,2], ",", ccdf(Chisq(1), abs(chi2medians[c,t,2])), ",", chi2lower[c,t,2], ",", chi2upper[c,t,2], ",", chi2medians[c,t,3], ",", ccdf(Chisq(1), abs(chi2medians[c,t,3])), ",", chi2lower[c,t,3], ",", chi2upper[c,t,3])
+                                
+                               # println(outfile,c,",", aminoacids[t],",",aminoacidatleaf[c,t],",", params.mu, ",",  params.tau, ",",  params.p, ",", params.lambda, ",",optstatuslabel,",",mles[c,t],",",aic, ",", D, ",", pval, ",", chi2medians_hponly[c,t,1], ",", ccdf(Chisq(1), abs(chi2medians_hponly[c,t,1])), ",", chi2lower_hponly[c,t,1], ",", chi2upper_hponly[c,t,1], ",", chi2medians_hponly[c,t,2], ",", ccdf(Chisq(1), abs(chi2medians_hponly[c,t,2])), ",", chi2lower_hponly[c,t,2], ",", chi2upper_hponly[c,t,2], ",", chi2medians_hponly[c,t,3], ",", ccdf(Chisq(1), abs(chi2medians_hponly[c,t,3])), ",", chi2lower_hponly[c,t,3], ",", chi2upper_hponly[c,t,3], ",", chi2medians[c,t,1], ",", ccdf(Chisq(1), abs(chi2medians[c,t,1])), ",", chi2lower[c,t,1], ",", chi2upper[c,t,1], ",", chi2medians[c,t,2], ",", ccdf(Chisq(1), abs(chi2medians[c,t,2])), ",", chi2lower[c,t,2], ",", chi2upper[c,t,2], ",", chi2medians[c,t,3], ",", ccdf(Chisq(1), abs(chi2medians[c,t,3])), ",", chi2lower[c,t,3], ",", chi2upper[c,t,3])
+                                if confintlower[c,t] == confintupper[c,t] == posterior[c,t] == 0.0
+                                    println(outfile,c,",", aminoacids[t],",",aminoacidatleaf[c,t],",", params.mu, ",",  params.tau, ",",  params.p, ",", params.lambda,",","-",",","-",",","0.5", ",",optstatuslabel,",",mles[c,t],",",aic, ",", D, ",", pval, ",", chi2medians_hponly[c,t,1], ",", ccdf(Chisq(1), abs(chi2medians_hponly[c,t,1])), ",", chi2lower_hponly[c,t,1], ",", chi2upper_hponly[c,t,1], ",", chi2medians_hponly[c,t,2], ",", ccdf(Chisq(1), abs(chi2medians_hponly[c,t,2])), ",", chi2lower_hponly[c,t,2], ",", chi2upper_hponly[c,t,2], ",", chi2medians_hponly[c,t,3], ",", ccdf(Chisq(1), abs(chi2medians_hponly[c,t,3])), ",", chi2lower_hponly[c,t,3], ",", chi2upper_hponly[c,t,3], ",", chi2medians[c,t,1], ",", ccdf(Chisq(1), abs(chi2medians[c,t,1])), ",", chi2lower[c,t,1], ",", chi2upper[c,t,1], ",", chi2medians[c,t,2], ",", ccdf(Chisq(1), abs(chi2medians[c,t,2])), ",", chi2lower[c,t,2], ",", chi2upper[c,t,2], ",", chi2medians[c,t,3], ",", ccdf(Chisq(1), abs(chi2medians[c,t,3])), ",", chi2lower[c,t,3], ",", chi2upper[c,t,3])
+                                else
+                                    println(outfile,c,",", aminoacids[t],",",aminoacidatleaf[c,t],",", params.mu, ",",  params.tau, ",",  params.p, ",", params.lambda,",",confintlower[c,t],",",confintupper[c,t],",",posterior[c,t], ",",optstatuslabel,",",mles[c,t],",",aic, ",", D, ",", pval, ",", chi2medians_hponly[c,t,1], ",", ccdf(Chisq(1), abs(chi2medians_hponly[c,t,1])), ",", chi2lower_hponly[c,t,1], ",", chi2upper_hponly[c,t,1], ",", chi2medians_hponly[c,t,2], ",", ccdf(Chisq(1), abs(chi2medians_hponly[c,t,2])), ",", chi2lower_hponly[c,t,2], ",", chi2upper_hponly[c,t,2], ",", chi2medians_hponly[c,t,3], ",", ccdf(Chisq(1), abs(chi2medians_hponly[c,t,3])), ",", chi2lower_hponly[c,t,3], ",", chi2upper_hponly[c,t,3], ",", chi2medians[c,t,1], ",", ccdf(Chisq(1), abs(chi2medians[c,t,1])), ",", chi2lower[c,t,1], ",", chi2upper[c,t,1], ",", chi2medians[c,t,2], ",", ccdf(Chisq(1), abs(chi2medians[c,t,2])), ",", chi2lower[c,t,2], ",", chi2upper[c,t,2], ",", chi2medians[c,t,3], ",", ccdf(Chisq(1), abs(chi2medians[c,t,3])), ",", chi2lower[c,t,3], ",", chi2upper[c,t,3])
+                                end
                             end
                         end
                     end
@@ -1033,7 +1906,7 @@ function mlmodel(rng,fastafile,treefile,outfilename,annotations,maxcols=10000000
             end
             close(outfile)
         end
-    end
+    end=#
 end
 
 function logprior(params::AATraitParameters)
@@ -1066,7 +1939,7 @@ function mcmc()
         seqnametoindex[taxon] = seqindex
         seqindex += 1
     end
-    annotationnames = split(parsed_args["traits"],",")
+    annotationnames = split(parsed_args["annotations"],",")
 
     traits = Int[]
     for name in names
@@ -1186,6 +2059,69 @@ function discretizegamma(shape::Float64, scale::Float64, numcategories::Int)
         gammadist = Gamma(shape, scale)
         return Float64[quantile(gammadist, v) for v in vs]
     end
+end
+
+function getLGmatrixwithdeletion(deletionrate::Float64)
+    Q = zeros(Float64,21,21)
+    for aa1=1:20
+        for aa2=1:20
+            if aa1 != aa2
+                Q[aa1,aa2] = LGexchangeability[aa1,aa2]*LGfreqs[aa2]
+            end
+        end
+    end
+    for aa=1:20
+        Q[21,aa] = deletionrate*LGfreqs[aa]
+        Q[aa,21] = Q[21,aa]
+    end
+    for aa1=1:21
+        Q[aa1,aa1] = 0.0
+        for aa2=1:21
+            if aa1 != aa2
+                Q[aa1,aa1] -= Q[aa1,aa2]
+            end
+        end
+    end
+    return Q
+end
+
+function getLGmatrixwithdeletion(deletionfreq::Float64, deletionrate::Float64)
+    S = zeros(Float64,21,21)
+    freqs = zeros(Float64,21)
+    for aa1=1:20
+        freqs[aa1] = LGfreqs[aa1]
+        for aa2=1:20
+            S[aa1,aa2] = LGexchangeability[aa1,aa2]
+        end
+    end 
+    for aa=1:20
+        S[21,aa] = deletionrate
+        S[aa,21] = deletionrate
+    end
+    freqs *= (1.0-deletionfreq)
+    freqs[21] = deletionfreq
+
+
+    Q = zeros(Float64,21,21)
+    for aa1=1:21
+        for aa2=1:21
+            if aa1 != aa2
+                Q[aa1,aa2] = S[aa1,aa2]*freqs[aa2]
+            end
+        end
+    end
+
+    for aa1=1:21
+        Q[aa1,aa1] = 0.0
+        for aa2=1:21
+            if aa1 != aa2
+                Q[aa1,aa1] -= Q[aa1,aa2]
+            end
+        end
+    end
+
+    println(S,"\t",freqs,"\t",Q)
+    return Q,freqs
 end
 
 function aa_alignmentloglikelihood(nodelist::Array{TreeNode,1}, numcols::Int, data::Array{Float64,3},subcolumnrefs::Array{Int,2}, mu::Float64, shape::Float64, numcats::Int=10)
@@ -1444,7 +2380,7 @@ function bhattacharya()
     if parsed_args["collapsetraits"] != nothing
         collapsetraits = Int[parse(Int,s) for s in split(parsed_args["collapsetraits"],",")]
     end
-    return bhattacharya(parsed_args["alignment"], parsed_args["tree"], split(parsed_args["traits"],","), collapsetraits, parsed_args["output"])
+    return bhattacharya(parsed_args["alignment"], parsed_args["tree"], split(parsed_args["annotations"],","), collapsetraits, parsed_args["output"])
 end
 
 function bhattacharya(fastafile::AbstractString, treefile, annotationnames, collapsetraits::Array{Int,1}, outfile::AbstractString)
@@ -1620,7 +2556,7 @@ function coevolution()
     if parsed_args["collapsetraits"] != nothing
         collapsetraits = Int[parse(Int,s) for s in split(parsed_args["collapsetraits"],",")]
     end
-    return coevolution(parsed_args["alignment"], parsed_args["tree"], split(parsed_args["traits"],","), collapsetraits, parsed_args["output"])
+    return coevolution(parsed_args["alignment"], parsed_args["tree"], split(parsed_args["annotations"],","), collapsetraits, parsed_args["output"])
 end
 
 function coevolution(fastafile::AbstractString, treefile, annotationnames, collapsetraits::Array{Int,1}, outfile::AbstractString)
@@ -2084,7 +3020,7 @@ function simulation()
     if parsed_args["collapsetraits"] != nothing
         collapsetraits = Int[parse(Int,s) for s in split(parsed_args["collapsetraits"],",")]
     end
-    return simulation(parsed_args["alignment"], parsed_args["tree"], split(parsed_args["traits"],","), collapsetraits, parsed_args["output"])
+    return simulation(parsed_args["alignment"], parsed_args["tree"], split(parsed_args["annotations"],","), collapsetraits, parsed_args["output"])
 end
 
 function processsimulations()
@@ -2270,7 +3206,7 @@ function simulation(fastafile::AbstractString, treefile, annotationnames, collap
     end
     seqindextonodeindex = zeros(Int,length(sequences))
     seqindex = 1
-    #println(seqnametonodeindex)
+    println(seqnametonodeindex)
     for (taxon,sequence) in zip(names, sequences)
         seqindextonodeindex[seqindex] = seqnametonodeindex[taxon]
         nodelist[seqnametonodeindex[taxon]].seqindex = seqindex
@@ -2340,26 +3276,26 @@ function simulation(fastafile::AbstractString, treefile, annotationnames, collap
 
     initial = AATraitParameters(Float64[31.47925915,1.0,7.456053451, 0.394240064])
     traitlikelihoods = gettraitlikelihoods(nodelist, traits, seqindextonodeindex)
-    #println(getarray(initial))
+    println(getarray(initial))
     initial = optimizetraitmodel(nodelist, traitlikelihoods, initial, :GN_DIRECT)
-    #println(getarray(initial))
+    println(getarray(initial))
     initial = optimizetraitmodel(nodelist, traitlikelihoods, initial, :GN_CRS2_LM)
-    #println(getarray(initial))
+    println(getarray(initial))
     initial = optimizetraitmodel(nodelist, traitlikelihoods, initial, :LN_COBYLA)
-    #println("ML estimates " getarray(initial))
+    println(getarray(initial))
 
     numsamples = 500
     numcats = 10
     aadata,subcolumnrefs = getaadata(nodelist,seqindextonodeindex,sequences)
     initialmu = 0.834965
     initialshape =  0.0936208
-    minf, minx = optimizealignmentlikelihood(nodelist, numcols, aadata, subcolumnrefs,initialmu,initialshape,numcats, 200)
-    println("Alignment maxmimum log-likelihood: ",minf)
+    minf, minx = optimizealignmentlikelihood(nodelist, numcols, aadata, subcolumnrefs,initialmu,initialshape,numcats, 100)
+    println("Finished",minx)
     initial.mu =  minx[1]
-    println("Mu: ",minx[1])
+    println("MU ",minx[1])
     maxll, sitelikelihoodsconditionals = aa_alignmentloglikelihood(nodelist, numcols, aadata, subcolumnrefs, minx[1], minx[2], numcats)
     rates = discretizegamma(minx[2], 1.0/minx[2], numcats)
-    println("Rates:",rates)
+    println("RATES",rates)
     startmu = initial.mu
 
     simrates = Float64[0.4,1.0,2.5]
@@ -2546,6 +3482,18 @@ function getchar(path::Array{Int,1}, time::Array{Float64}, t::Float64)
     return c
 end
 
+function marginaltraitprobability(aa, targetaa, piHP::Float64, lambda::Float64, freqs::Array{Float64,1}=LGfreqs)
+    #marginalHP = 
+    marginalHP = piHP*(lambda + (1.0/lambda))/((piHP*(lambda + (1.0/lambda))) + 2.0*(1.0-piHP))
+    #marginalHP = piHP*(lambda + (1.0/lambda))/((piHP*(lambda + (1.0/lambda))) + 2.0*(1.0-piHP))
+    #println(aa,"\t",targetaa,"\t", piHP, "\t", lambda,"\t",marginalHP)
+    if aa == targetaa
+        return piHP*lambda/((1.0-piHP) + piHP*lambda)
+    else
+        return piHP/((1.0-piHP)*lambda + piHP)
+    end
+end
+
 function HAscore(seq::Array{Int,1})
     score = 0.0
     total = 0.0
@@ -2628,21 +3576,821 @@ function getjsontree(nodelist::Array{TreeNode,1}, traits::Array{Int,1})
     end
     return JSON.json(json)
 end
+
+function getcolumn(csvfile, key::String)
+    fin = open(csvfile, "r")
+    header = ""
+    data = []
+    colindex = 1
+    for line in readlines(fin)
+        spl = split(strip(string(line)), [',', '\"'],keepempty=false)
+        if header == ""
+            header = spl
+            for (i,colname) in  enumerate(spl)
+                #println("!",strip(colname),",",strip(key))
+                if colname == key
+                    colindex = i
+                end
+            end
+        else
+            push!(data, spl[colindex])
+        end
+    end
+    close(fin)
+    integer = true
+    numeric = true
+    for v in data
+        try
+            parse(Int,v)
+        catch
+            integer = false
+        end
+        try
+            parse(Float64,v)
+        catch
+            numeric = false
+        end
+    end
+    if integer
+        retdata = Int[]
+        for v in data
+            push!(retdata, parse(Int,v))
+        end
+        return retdata
+    elseif numeric
+        retdata = Float64[]
+        for v in data
+            push!(retdata, parse(Float64,v))
+        end
+        return retdata
+    end
+    return data
+
+end
+
+include("Mapping.jl")
+function scoresequence2(mappingsequence::String, segment="H7HA")
+    alignment = ""
+
+    scores = []
+    if segment == "H7HA"
+        alignment = "../data/H7NX/HA/H7_HA_alnP.fas"
+        push!(scores, (143, 'A', 0.36327, 0.47780))
+        push!(scores, (143, 'T', 0.28351, 7.04113))
+        push!(scores, (274, 'I', 0.16081, 6.19619))
+        push!(scores, (438, 'I', 0.17541, 4.62822))
+    end
+    mapping, revmapping = Mapping.createmapping(alignment, mappingsequence)
+    v = Float64[0.5, 0.5]
+    for (pos,targetaa,p,lambda) in scores
+        seqaa = get(mappingsequence, mapping[pos], "-")
+        marginal = marginaltraitprobability(seqaa, targetaa, p, lambda)
+        v[1] *= marginal
+        v[2] *= (1.0-marginal)
+        v /= sum(v)
+        println(pos,"\t",seqaa,"\t",targetaa,"\t",v,"\t",marginal)
+    end
+end
+
+function geommean(probs::Array{Float64,1})
+    wi = 1.0
+    u = sum(log.(probs.^wi))
+    v = logsumexp(u, sum((1.0 .- probs).^wi))
+    return exp(u - v)
+end
+
+function satopaaprobcombinations(probs::Array{Float64,1})
+    v = 0.0
+    wi = 1.0
+    alpha = 1.0
+    for p in probs
+        v += log((p/(1.0-p))^wi)
+    end
+    v *= alpha
+    return exp(v - logsumexp(0.0, v))
+end
+
+#=
+function scoresequence(mappingsequence::String, segment="H7HA")
+    alignment = ""
+
+    targetpositions = [("HA",143),("HA",274),("HA", 438),("HA",384)]
+    segments = AbstractString[]
+    positions = Int[]
+    targets = AbstractString[]
+    ps = Float64[]
+    lambdas = Float64[]
+    if segment == "H7HA"
+        alignment = "../data/H7NX/HA/H7_HA_alnP.fas"        
+        csvfile = "../data/H7NX/HA/H7_HA_alnP.fas.results.update - Copy (13).csv"
+        segments = ParallelEvolution.getcolumn(csvfile, "Segment")
+        positions = ParallelEvolution.getcolumn(csvfile, "Site")
+        targets = ParallelEvolution.getcolumn(csvfile, "Target AA")
+        ps = ParallelEvolution.getcolumn(csvfile, "p")
+        lambdas = ParallelEvolution.getcolumn(csvfile, "lambda")        
+    end
+
+    marginalprobs = Float64[]
+    mapping, revmapping = Mapping.createmapping(alignment, mappingsequence)
+    for (segment,pos,target,p,lambda) in zip(segments,positions,targets,ps,lambdas)
+        for (targetsegment, seqpos) in targetpositions
+            #targetsegment == segment && 
+            if seqpos == pos && mapping[pos] > 0 && mappingsequence[mapping[seqpos]] == target[1]
+                marginalprob = marginaltraitprobability(target[1], target[1], p, lambda)
+                push!(marginalprobs, marginalprob)
+                println(segment,"\t",pos,"\t",target,"\t",p,"\t",lambda, "\tmarginal: ", marginalprob)
+            end
+        end
+    end
+    println(marginalprobs)
+    println(satopaaprobcombinations(marginalprobs))
+    #println(geommean(marginalprobs))
+    
+    #=
+    mapping, revmapping = Mapping.createmapping(alignment, mappingsequence)
+    v = Float64[0.5, 0.5]
+    for (pos,targetaa,p,lambda) in scores
+        seqaa = get(mappingsequence, mapping[pos], "-")
+        marginal = marginaltraitprobability(seqaa, targetaa, p, lambda)
+        v[1] *= marginal
+        v[2] *= (1.0-marginal)
+        v /= sum(v)
+        println(pos,"\t",seqaa,"\t",targetaa,"\t",v,"\t",marginal)
+    end=#
+end
+
+function scorealignment(fastafile, segment::AbstractString="H7HA")
+    sequences = AbstractString[]
+    names = AbstractString[]
+    FastaIO.FastaReader(fastafile) do fr
+        for (desc, seq) in fr
+            push!(names, replace(strip(desc), "\\r" => ""))
+            push!(sequences, replace(seq, "\r" => ""))
+        end
+    end
+    for (name,seq) in zip(names,sequences)
+        println(name)
+        scoresequence(seq, segment)
+    end
+
+end
+=#
+
+function scoresequence(alignmentfile::AbstractString, mappingsequence::AbstractString, csvfile::AbstractString, targetpositions::Array{Int,1}, mapping=nothing, revmapping=nothing)
+    segments = AbstractString[]
+    positions = Int[]
+    targets = AbstractString[]
+    ps = Float64[]
+    lambdas = Float64[]
+
+    segments = ParallelEvolution.getcolumn(csvfile, "Segment")
+    positions = ParallelEvolution.getcolumn(csvfile, "Site")
+    targets = ParallelEvolution.getcolumn(csvfile, "Target AA")
+    ps = ParallelEvolution.getcolumn(csvfile, "p")
+    lambdas = ParallelEvolution.getcolumn(csvfile, "lambda")
+
+    marginalprobs = Float64[]
+    if mapping == nothing
+        println("CREATING MAPPING")
+        mapping, revmapping = Mapping.createmapping(alignmentfile, mappingsequence)
+    end
+    
+    for (segment,pos,target,p,lambda) in zip(segments,positions,targets,ps,lambdas)
+        for seqpos in targetpositions
+            #targetsegment == segment && 
+            if seqpos == pos && mapping[pos] > 0 && mappingsequence[mapping[seqpos]] == target[1]
+                marginalprob = marginaltraitprobability(target[1], target[1], p, lambda)
+                push!(marginalprobs, marginalprob)
+                #println(segment,"\t",pos,"\t",target,"\t",p,"\t",lambda, "\tmarginal: ", marginalprob)
+            end
+        end
+    end
+
+    #=
+    targetpositions = [(143,'T'),(274,'I'),(438,'I'),(384,'N')]
+    for (segment,pos,target,p,lambda) in zip(segments,positions,targets,ps,lambdas)
+        for (seqpos,targetaa) in targetpositions
+            #targetsegment == segment && 
+            if seqpos == pos && mapping[pos] > 0 && targetaa == target[1] && mappingsequence[mapping[seqpos]] == target[1]
+                marginalprob = marginaltraitprobability(target[1], target[1], p, lambda)
+                push!(marginalprobs, marginalprob)
+                #println(segment,"\t",pos,"\t",target,"\t",p,"\t",lambda, "\tmarginal: ", marginalprob)
+            end
+        end
+    end=#
+    return marginalprobs
+end
+
+function collatesequences(alignments::Array{AbstractString,1}, segmentnames::Array{AbstractString,1})
+    seqdict = Dict{String, Array{Tuple{AbstractString,AbstractString},1}}()
+    for (segment,alignment) in zip(segmentnames,alignments)
+        if isfile(alignment)
+            sequences = AbstractString[]
+            names = AbstractString[]
+            FastaIO.FastaReader(alignment) do fr
+                for (desc, seq) in fr
+                    push!(names, replace(strip(desc), "\\r" => ""))
+                    push!(sequences, replace(seq, "\r" => ""))
+                end
+            end
+            for (name,seq) in zip(names,sequences)
+                canonicalname = replace(name, "|" => ".")
+                ls = get(seqdict,canonicalname, Tuple{AbstractString,AbstractString}[])
+                push!(ls, (segment,seq))
+                seqdict[canonicalname] = ls
+            end
+        end
+    end
+    return seqdict
+end
+
+function scorelisttomatrix(ls::Array{Array{Float64,1},1})
+    mat = zeros(Float64,length(ls),length(ls[1]))
+    for (i,arr) in enumerate(ls)
+        for (j,v) in enumerate(arr)
+            mat[i,j] = v
+        end
+    end
+    return mat
 end
 
 
+using Plots
+#using ROC
+function main2()
+    alignments = AbstractString["../data/H7NX/HA/H7_HA_alnP.fas", "../data/H7NX/PB1/H7_PB1_alnP.fasta", "../data/H7NX/PB2/H7_PB2_alnP.fasta", "../data/H7NX/M/H7_M1_alnP.fasta", "../data/H7NX/NP/H7_NP_alnP.fasta", "../data/H7NX/NS/H7_NS1_alnP.fasta"]
+    segments = AbstractString["H7HA","H7PB1", "H7PB2", "H7M", "H7NP", "H7NS1"]
+    alignmentdict = Dict{String, String}()
+    for (segmentname,alignmentfile) in zip(segments,alignments)
+        alignmentdict[segmentname] = alignmentfile
+    end
+    #lignmentdict = Dict{String, String}()
+    #lignmentdict["H7HA"] = "../data/H7NX/HA/H7_HA_alnP.fas"
+    #lignmentdict["H7HA"] = "../data/H7NX/HA/H7_HA_alnP.fas"
 
-parsed_args = TraitEvolution.parse_commandline()
+    csvdict = Dict{String, String}()
+    csvdict["H7HA"] = "../data/H7NX/HA/H7_HA_alnP.fas.results.update - Copy (14).csv"
+    csvdict["H7PB2"] = "../data/H7NX/PB2/H7_PB2_alnP.fasta.results.update - Copy.csv"
+    csvdict["H7M"] = "../data/H7NX/M/H7_M1_alnP.fasta.results.update.csv"
+    csvdict["H7NP"] = "../data/H7NX/NP/H7_NP_alnP.fasta.results.update.csv"
+    posdict = Dict{String, Array{Int,1}}()
+    posdict["H7HA"] = Int[143, 274, 438, 384]
+    posdict["H7PB2"] = Int[355, 480]
+    #posdict["H7PB1"] = Int[154, 152]
+    #posdict["H7NS1"] = Int[209]
+
+    mappings = Dict{AbstractString, Tuple{Dict{Int,Int},Dict{Int,Int}}}()
+    for segmentname in segments
+        if haskey(alignmentdict, segmentname)
+            mapping, revmapping = Mapping.createmapping2(alignmentdict[segmentname], alignmentdict[segmentname])
+            mappings[segmentname] = (mapping, revmapping)
+        end
+    end
+
+
+    seqdict = ParallelEvolution.collatesequences(alignments,segments)
+    satoscores = Float64[]
+    geomscores = Float64[]
+    scorematrix = Array{Float64,1}[]
+    labels = Int[]
+    seqindex = 0
+    for seqname in keys(seqdict)
+        allmarginalprobs = Float64[]
+        for (segmentname, seq) in seqdict[seqname]
+            mapping,revmapping = mappings[segmentname]
+            if haskey(posdict, segmentname)
+                marginalprobs = ParallelEvolution.scoresequence(alignmentdict[segmentname], seq, csvdict[segmentname], posdict[segmentname], mapping, revmapping)
+                #println(segmentname,"\t",marginalprobs)
+                append!(allmarginalprobs, marginalprobs)
+            end
+        end
+        while length(allmarginalprobs) < 6
+            push!(allmarginalprobs, 0.2)
+        end
+        if length(allmarginalprobs) > 0
+            classlabel = 0
+            if occursin(".HP.", seqname)
+                classlabel = 1
+            end
+
+            push!(scorematrix,allmarginalprobs)
+            satoscore = satopaaprobcombinations(allmarginalprobs)
+            push!(satoscores, satoscore)
+            geomscore = mean(allmarginalprobs)
+            push!(geomscores, geomscore)
+            
+            
+            push!(labels, classlabel)
+            println(seqname,"\t",classlabel,"\t", satoscore,"\t",geomscore,"\t", length(seqdict[seqname]),"\t", allmarginalprobs)
+            satorocdata = roc(satoscores,labels,1)
+            geomrocdata = roc(geomscores,labels,1)
+            println(AUC(satorocdata),"\t",AUC(geomrocdata))
+            seqindex += 1
+            if seqindex % 10 == 0
+                plot(satorocdata);
+                savefig("sato_roc.png")
+                plot(geomrocdata);
+                savefig("geom_roc.png")
+
+                #println(scorelisttomatrix(scorematrix))
+            end
+        end
+    end
+end
+
+using NPZ
+function creatematrix(subtype::AbstractString="H5", queryalignments=AbstractString[])
+    alignments = AbstractString[]
+    segments = AbstractString[]
+    alignmentdict = Dict{String, String}()
+    posdict = Dict{String, Array{Tuple{Int,Char},1}}()
+
+    if subtype == "H7"
+        alignments = AbstractString["../data/H7NX/HA/H7_HA_alnP.fas", "../data/H7NX/PB1/H7_PB1_alnP.fasta", "../data/H7NX/PB2/H7_PB2_alnP.fasta", "../data/H7NX/M/H7_M1_alnP.fasta", "../data/H7NX/NP/H7_NP_alnP.fasta", "../data/H7NX/NS/H7_NS1_alnP.fasta"]
+        segments = AbstractString["H7HA","H7PB1", "H7PB2", "H7M", "H7NP", "H7NS1"]    
+        posdict["H7HA"] = [(143,'T'),(274,'I'),(438,'I'),(384,'N')]
+        posdict["H7PB2"] = [(355,'K'),(480,'I')]
+        posdict["H7NS1"] = [(209,'N')]
+        posdict["H7PB1"] = [(154,'D'),(152,'L')]
+    else
+        alignments = AbstractString[]
+        segments = AbstractString["H5HA","H5PB1", "H5PB2", "H5M", "H5NS", "H5PA"] 
+        
+        
+        push!(alignments, "../data/H5_MODEL/H5/H5_aln_shortP.fasta")
+        posdict["H5HA"] = [(379,'R'), (242,'I'), (145,'L'), (154,'I'), (154,'L'), (127,'L'), (167,'T'), (204,'I'), (157,'P')]        
+        push!(alignments, "../data/H5_MODEL/PB1/PB1_shortP.fasta")
+        posdict["H5PB1"] = [(113,'I')]
+        push!(alignments, "../data/H5_MODEL/PB2/PB2_shortP.fasta")
+        posdict["H5PB2"] = [(674,'T'),(451,'T'),(627,'K'),(508,'Q')]
+        push!(alignments, "../data/H5_MODEL/M/M_shortP.fasta")
+        posdict["H5M"] = [(101,'K')]
+        
+        #push!(alignments, "../data/H5NX/NS_shortP.fasta")        
+        #push!(alignments, "../data/H5NX/PA_shortP.fasta")
+
+        #=
+        push!(alignments, "../data/H5_MODEL/H5/H5_aln_shortP.fasta")
+        posdict["H5HA"] = [(379,'R'), (242,'I'), (145,'L')]        
+        push!(alignments, "../data/H5_MODEL/PB1/PB1_shortP.fasta")
+        posdict["H5PB1"] = [(113,'I')]
+        push!(alignments, "../data/H5_MODEL/PB2/PB2_shortP.fasta")
+        posdict["H5PB2"] = [(674,'T')]
+        push!(alignments, "../data/H5_MODEL/M/M_shortP.fasta")
+        posdict["H5M"] = [(101,'K')]
+        =#
+
+    end
+    alltargets = AbstractString[]
+    for segmentname in segments
+        if haskey(posdict,segmentname)
+            for (pos,targetaa) in posdict[segmentname]
+                push!(alltargets, string(segmentname[3:end],"_",pos,targetaa))
+            end
+        end
+    end
+    println(join(alltargets,"\t"))
+    #exit()
+
+    hasquery = true
+    if length(queryalignments) == 0
+        queryalignments = alignments
+        hasquery = false
+    end
+
+    mappings = Dict{AbstractString, Tuple{Dict{Int,Int},Dict{Int,Int}}}()
+    for (segmentname, alignment, queryalignment) in zip(segments,alignments,queryalignments)
+        if isfile(queryalignment)
+            println(alignment,"\t",queryalignment,"\tfound:yes")
+            mapping, revmapping = Mapping.createmapping2(alignment, queryalignment)
+            mappings[segmentname] = (mapping, revmapping)
+            println(mappings[segmentname])
+        else
+            println(alignment,"\t",queryalignment,"\tfound:no")
+        end
+    end
+
+    seqdict = ParallelEvolution.collatesequences(queryalignments,segments)
+    rows = Array{Float64,1}[]
+    charrows = AbstractString[]
+    labels = Float64[]
+    names = AbstractString[]
+    for (seqindex, seqname) in enumerate(keys(seqdict))
+        hasallsegments = true
+        for segmentname in keys(posdict)
+            hasmatch = false
+            for (seqsegmentname,seq) in seqdict[seqname]
+                if seqsegmentname == segmentname
+                    hasmatch = true
+                    break
+                end
+            end
+            if !hasmatch
+                hasallsegments = false
+            end
+        end
+        if true || hasallsegments
+            row = Float64[]
+            chars = ""
+            targetchars = ""
+            for segmentname2 in segments
+                isfound = false 
+                for (segmentname,seq) in seqdict[seqname]
+                    if haskey(posdict, segmentname2)
+                        mapping,revmapping = mappings[segmentname2]
+                        if segmentname == segmentname2
+                            for (pos, targetaa) in posdict[segmentname2]
+                                #println(segmentname,"\t",pos,"\t", targetaa, "\t", seq[mapping[pos]])
+                                if targetaa == seq[mapping[pos]]
+                                    push!(row, 1.0)
+                                    chars = string(chars, seq[mapping[pos]])
+                                    targetchars = string(targetchars,targetaa)
+                                else
+                                    push!(row, 0.0)
+                                    chars = string(chars, seq[mapping[pos]])
+                                    targetchars = string(targetchars,targetaa)
+                                end
+                            end
+                            isfound = true
+                        end
+                    end
+                end
+                if !isfound
+                    if haskey(posdict, segmentname2)
+                        for (pos, targetaa) in posdict[segmentname2]
+                            push!(row, NaN)
+                            chars = string(chars, "?")
+                            targetchars = string(targetchars,targetaa)
+                        end
+                    end
+                end
+            end
+            classlabel = 0
+            if occursin(".HP.", seqname)
+                push!(labels, 1.0)
+                classlabel = 1
+            else
+                push!(labels, 0.0)
+            end
+            println(row,"\t",classlabel)
+            push!(rows,row)
+            #println(chars,"\t",targetchars)
+            push!(charrows, chars)
+            push!(names, seqname)
+        end
+    end
+
+    mat = zeros(Float64, length(rows), length(rows[1]))
+    for i=1:size(mat,1)
+        for j=1:size(mat,2)
+            mat[i,j] = rows[i][j]
+        end
+    end
+    namefile = ""
+    if hasquery
+        namefile = string(subtype,"_query_names.txt")
+        npzwrite(string(subtype,"_query_X.npy"), mat)
+        npzwrite(string(subtype,"_query_y.npy"), labels)
+    else
+        namefile = string(subtype,"_training_names.txt")
+        npzwrite(string(subtype,"_training_X.npy"), mat)
+        npzwrite(string(subtype,"_training_y.npy"), labels)
+    end
+    fout = open(namefile,"w")
+    for (name,chars) in zip(names,charrows)
+        println(fout,name,"\t",chars)
+    end
+    close(fout)
+end
+
+function simpleimputation(subtype="H7", targetalignments::Array{AbstractString,1}=AbstractString[])
+    alignments = AbstractString[]
+    segments = AbstractString[]
+    alignmentdict = Dict{String, String}()
+    posdict = Dict{String, Array{Tuple{Int,Char},1}}()
+
+    if subtype == "H7"
+        #referencealignments = AbstractString["../data/H7NX/HA/H7_HA_alnP.fas", "../data/H7NX/PB1/H7_PB1_alnP.fasta", "../data/H7NX/PB2/H7_PB2_alnP.fasta", "../data/H7NX/M/H7_M1_alnP.fasta", "../data/H7NX/NP/H7_NP_alnP.fasta", "../data/H7NX/NS/H7_NS1_alnP.fasta"]
+        referencealignments = AbstractString["../data/H7NX/HA/H7_HA_alnP.fas", "../data/H7NX/PB1/H7_PB1_alnP.fasta", "../data/H7NX/PB2/H7_PB2_alnP.fasta", "../data/H7NX/M/H7_M1_alnP.fasta", "../data/H7NX/NP/H7_NP_alnP.fasta", "../data/H7NX/NS/H7_NS1_alnP.fasta", "", "../data/H7NX/PA/H7_PA_alnP.fasta"]
+        segments = AbstractString["H7HA","H7PB1", "H7PB2", "H7M", "H7NP", "H7NS1", "H7NA", "H7PA"]   
+        posdict["H7HA"] = [(143,'T'),(274,'I'),(438,'I'),(384,'N')]
+        push!(posdict["H7HA"], (402, 'K'))
+        push!(posdict["H7HA"], (335, 'T'))
+        push!(posdict["H7HA"], (287, 'K'))
+        push!(posdict["H7HA"], (175, 'G'))
+        push!(posdict["H7HA"], (152, 'P'))
+        push!(posdict["H7HA"], (175, 'E'))
+      
+        posdict["H7PB1"] = [(154,'D'),(152,'L')]
+        push!(posdict["H7PB1"], (473, 'I'))
+        push!(posdict["H7PB1"], (709, 'I'))
+
+        posdict["H7PB2"] = [(355,'K'),(480,'I')]
+        push!(posdict["H7PB2"], (356,'I'))
+        push!(posdict["H7PB2"], (584,'I'))
+        push!(posdict["H7PB2"], (640,'I'))
+        push!(posdict["H7PB2"], (655,'A'))
+        push!(posdict["H7PB2"], (661,'A'))
+        push!(posdict["H7PB2"], (702,'R'))
+
+        posdict["H7NS1"] = [(209,'N')]
+
+       # posdict["H7M"] = []
+        #push!(posdict["H7M"], (95, 'K'), (97, 'I'), (131, 'V'))
+        #posdict["H7NP"] = []
+        #push!(posdict["H7NP"], (101, 'E'))
+        posdict["H7NS1"] = []
+        push!(posdict["H7NS1"], (56, 'A'))
+        push!(posdict["H7NS1"], (180, 'T'))
+        #posdict["H7PA"] = []
+        #push!(posdict["H7PA"], (32, 'M'))
+        #push!(posdict["H7PA"], (63, 'I'))
+        #push!(posdict["H7PA"], (115, 'K'))
+        #push!(posdict["H7PA"], (237, 'K'))
+    else
+        referencealignments = AbstractString[]
+        segments = AbstractString["H5HA","H5PB1", "H5PB2", "H5M", "H5NS", "H5PA"] 
+
+        push!(referencealignments, "../data/H5_MODEL/H5/H5_aln_shortP.fasta")
+        posdict["H5HA"] = [(379,'R'), (242,'I'), (145,'L'), (154,'I'), (154,'L'), (127,'L'), (167,'T'), (204,'I'), (157,'P')]        
+        push!(posdict["H5HA"], (214, 'V'))
+        push!(posdict["H5HA"], (199, 'N'))
+        push!(posdict["H5HA"], (172, 'T'))
+        push!(posdict["H5HA"], (145, 'A'))
+        push!(posdict["H5HA"], (145, 'V'))
+        push!(posdict["H5HA"], (145, 'I'))
+        push!(posdict["H5HA"], (145, 'Q'))
+        push!(posdict["H5HA"], (145, 'P'))
+        push!(posdict["H5HA"], (519, 'I'))
+        push!(posdict["H5HA"], (145, 'D'))
+        push!(posdict["H5HA"], (145, 'T'))
+        push!(posdict["H5HA"], (170, 'N'))
+        push!(posdict["H5HA"], (145, 'N'))        
+        push!(posdict["H5HA"], (489,'R'))
+        push!(posdict["H5HA"], (87,'V'))
+        push!(posdict["H5HA"], (149,'A'))
+        push!(posdict["H5HA"], (145, 'E'))  
+        #=      
+        push!(posdict["H5HA"], (87,'Q'))
+        #push!(posdict["H5HA"], (145,'M')) 
+        push!(posdict["H5HA"], (200,'I'))
+        push!(posdict["H5HA"], (200,'T'))
+        push!(posdict["H5HA"], (254,'T'))
+        push!(posdict["H5HA"], (127,'L'))
+        push!(posdict["H5HA"], (87,'D'))
+        push!(posdict["H5HA"], (87,'E'))
+        push!(posdict["H5HA"], (200,'P'))
+        push!(posdict["H5HA"], (200,'N'))
+        push!(posdict["H5HA"], (142,'E'))
+        push!(posdict["H5HA"], (488,'I'))
+        push!(posdict["H5HA"], (205,'T'))
+        push!(posdict["H5HA"], (128,'K'))
+        push!(posdict["H5HA"], (200,'E'))
+        push!(posdict["H5HA"], (7,'F'))        
+        push!(posdict["H5HA"], (205,'E'))        
+        push!(posdict["H5HA"], (139,'P'))
+        push!(posdict["H5HA"], (87,'M'))
+        #push!(posdict["H5HA"], (298,'I'))
+        #push!(posdict["H5HA"], (298,'I'))=#
+        push!(referencealignments, "../data/H5_MODEL/PB1/PB1_shortP.fasta")
+        posdict["H5PB1"] = [(113,'I')]
+        #push!(posdict["H5PB1"], (111,'I'))
+        push!(referencealignments, "../data/H5_MODEL/PB2/PB2_shortP.fasta")
+        posdict["H5PB2"] = [(674,'T'),(451,'T'),(627,'K'),(508,'Q')]
+        #push!(posdict["H5PB2"], (494,'I'))
+        #push!(posdict["H5PB2"], (649,'I'))
+        #push!(posdict["H5PB2"], (495,'I'))
+        #push!(posdict["H5PB2"], (108,'S'))
+        push!(referencealignments, "../data/H5_MODEL/M/M_shortP.fasta")
+        posdict["H5M"] = [(101,'K')]
+        push!(posdict["H5M"], (205,'I'))
+        #push!(posdict["H5M"], (166,'A'))
+    end
+    alltargets = AbstractString[]
+    for segmentname in segments
+        if haskey(posdict,segmentname)
+            for (pos,targetaa) in posdict[segmentname]
+                push!(alltargets, string(segmentname[3:end],"_",pos,targetaa))
+            end
+        end
+    end
+    #println(join(alltargets,"\t"))
+    #exit()
+
+    hasquery = true
+    if length(targetalignments) == 0
+        targetalignments = referencealignments
+        hasquery = false
+    end
+
+    refseqdict = ParallelEvolution.collatesequences(referencealignments,segments)
+    targetseqdict = ParallelEvolution.collatesequences(targetalignments,segments)
+
+    mappings = Dict{AbstractString, Tuple{Dict{Int,Int},Dict{Int,Int}}}()
+    for (segmentname, referencealignment, targetalignment) in zip(segments,referencealignments,targetalignments)
+        if isfile(targetalignment)
+            println(referencealignment,"\t",targetalignment,"\tfound:yes")
+            mapping, revmapping = Mapping.createmapping2(referencealignment, targetalignment)
+            mappings[segmentname] = (mapping, revmapping)
+            println(mappings[segmentname])
+        else
+            println(referencealignment,"\t",targetalignment,"\tfound:no")
+        end
+    end
+
+    allseqdict = merge(refseqdict, targetseqdict)
+
+
+    refseqdict2 = Dict{Tuple{AbstractString,AbstractString}, AbstractString}()
+    targetseqdict2 = Dict{Tuple{AbstractString,AbstractString}, AbstractString}()
+    for refseqname in keys(refseqdict)     
+        for (refsegmentname,refseq) in refseqdict[refseqname]
+            refseqdict2[(refseqname,refsegmentname)] = refseq
+        end
+    end
+    for targetseqname in keys(targetseqdict)     
+        for (targetsegmentname,targetseq) in targetseqdict[targetseqname]
+            targetseqdict2[(targetseqname,targetsegmentname)] = targetseq
+        end
+    end    
+    allseqdict2 = merge(refseqdict2, targetseqdict2)
+
+    for segment in segments
+        for targetseqname in keys(targetseqdict)
+            if !haskey(targetseqdict2, (targetseqname, segment))            
+                bestdist = (0.0,0.0)
+                bestseqname = ""
+                for refseqname in keys(refseqdict)
+                    if haskey(allseqdict2, (refseqname, segment))
+                        matches = 0.0
+                        total = 1e-100
+                        for (refsegment, refseq) in allseqdict[refseqname]
+                            if haskey(targetseqdict2, (targetseqname, refsegment))
+                                mapping, revmapping = mappings[refsegment]
+                                targetseq = targetseqdict2[(targetseqname, refsegment)]
+                                for pos=1:length(refseq)
+                                    if mapping[pos] > 0
+                                        #println(refsegment,"\t",refseq[pos],"\t", targetseq[mapping[pos]])
+                                        if refseq[pos] == targetseq[mapping[pos]]
+                                            matches += 1.0
+                                        end
+                                        total += 1.0
+                                    end
+                                end
+                            end
+                        end
+                        similarity = (matches/total, total)
+                        #println(similarity)
+                        #println(bestdist)
+                        if similarity[1] > bestdist[1] || (similarity[1] == bestdist[1] && similarity[2] > bestdist[2])
+                            bestdist = (similarity[1],total)
+                            bestseqname = refseqname                    
+                           # println(matches,"\t",total,"\t",similarity)
+                        end
+                    end
+                end
+                if haskey(mappings, segment)
+                    mapping, revmapping = mappings[segment]
+                    refseqsegment = allseqdict2[(bestseqname, segment)]
+                    reconstructtargetsegment = ""
+                    for pos=1:length(revmapping)
+                        if revmapping[pos] > 0
+                            reconstructtargetsegment = string(reconstructtargetsegment, refseqsegment[revmapping[pos]])
+                        else
+                            reconstructtargetsegment = string(reconstructtargetsegment, "-")
+                        end
+                    end
+                    targetseqdict2[(targetseqname, segment)] = reconstructtargetsegment
+                    println(bestdist)
+                    #println("-------------------------------------------------")
+                end
+            end       
+        end
+    end
+
+    rows = Array{Float64,1}[]
+    charrows = AbstractString[]
+    labels = Float64[]
+    names = AbstractString[]
+    for seqname in keys(targetseqdict)
+        row = Float64[]
+        chars = ""
+        targetchars = ""
+        for segmentname2 in segments
+            isfound = false
+            if haskey(mappings, segmentname2) && haskey(posdict,segmentname2)
+                mapping,revmapping = mappings[segmentname2]
+                seq = targetseqdict2[(seqname,segmentname2)]
+                for (pos, targetaa) in posdict[segmentname2]
+                    #println(pos)
+                    #println("->", mapping[pos])
+                    if mapping[pos] > 0 && targetaa == seq[mapping[pos]]
+                        push!(row, 1.0)
+                        chars = string(chars, seq[mapping[pos]])
+                        targetchars = string(targetchars,targetaa)
+                    else
+                        push!(row, 0.0)
+                        char = 'X'
+                        if mapping[pos] > 0
+                            char = seq[mapping[pos]]
+                        end
+                        chars = string(chars, char)
+                        targetchars = string(targetchars,targetaa)
+                    end
+                end
+                isfound = true
+            end
+        end
+        classlabel = 0
+        println(seqname)
+        if occursin(".HP.", seqname)
+            push!(labels, 1.0)
+            classlabel = 1
+        else
+            push!(labels, 0.0)
+        end
+        println(row,"\t",classlabel)
+        push!(rows,row)
+        #println(chars,"\t",targetchars)
+        push!(charrows, chars)
+        push!(names, seqname)
+    end
+
+    mat = zeros(Float64, length(rows), length(rows[1]))
+    for i=1:size(mat,1)
+        for j=1:size(mat,2)
+            mat[i,j] = rows[i][j]
+        end
+    end
+    namefile = ""
+    if hasquery
+        namefile = string(subtype,"_query_names.txt")
+        npzwrite(string(subtype,"_query_X.npy"), mat)
+        npzwrite(string(subtype,"_query_y.npy"), labels)
+    else
+        namefile = string(subtype,"_training_names.txt")
+        npzwrite(string(subtype,"_training_X.npy"), mat)
+        npzwrite(string(subtype,"_training_y.npy"), labels)
+    end
+    fout = open(namefile,"w")
+    for (name,chars) in zip(names,charrows)
+        println(fout,name,"\t",chars)
+    end
+    close(fout)
+
+end
+
+end
+
+#AbstractString["H7HA","H7PB1", "H7PB2", "H7M", "H7NP", "H7NS1", "H7NA", "H7PA"]   
+#ali
+
+#queryalignments = AbstractString["../data/Metric_Datasets/H7/H7/H7_HA_sampled_P.fasta", "../data/Metric_Datasets/H7/PB1/H7_PB1_sampled_P.fasta", "../data/Metric_Datasets/H7/PB2/H7_PB2_sampled_P.fasta", "../data/Metric_Datasets/H7/M/H7_M_aln_P.fasta", "../data/Metric_Datasets/H7/NP/H7_NP_aln_P.fasta", "../data/Metric_Datasets/H7/NS1/H7_NS1_sampled_P.fasta", "../data/Metric_Datasets/H7/NA/H7_NA_aln_P.fasta", "../data/Metric_Datasets/H7/PA/H7_PA_aln_P.fasta"]
+#ParallelEvolution.creatematrix("H7",queryalignments)
+#ParallelEvolution.creatematrix("H7")
+#ParallelEvolution.simpleimputation("H7")
+#ParallelEvolution.simpleimputation("H7", queryalignments)
+#exit()
+
+#segments = AbstractString["H5HA","H5PB1", "H5PB2", "H5M", "H5NS", "H5PA", "H5NA", "H5NP"] 
+#queryalignments = AbstractString["../data/Metric_Datasets/H5/HA/H5_HA_sampled_P.fasta", "../data/Metric_Datasets/H5/PB1/H5_PB1_sampled_P.fasta", "../data/Metric_Datasets/H5/PB2/H5_PB2_sampled_P.fasta", "../data/Metric_Datasets/H5/M/H5_M_sampled_P.fasta", "", ""]
+#queryalignments = AbstractString["../data/Metric_Datasets/H5/HA/H5_HA_P.fasta", "../data/Metric_Datasets/H5/PB1/H5_PB1_P.fasta", "../data/Metric_Datasets/H5/PB2/H5_PB2_P.fasta", "../data/Metric_Datasets/H5/M/H5_M_P.fasta", "", "../data/Metric_Datasets/H5/PA/PA_short_P.fasta", "../data/Metric_Datasets/H5/PA/PA_short_P.fasta", "../data/Metric_Datasets/H5/NA/NA_H5NX_short_F_P.fasta", "../data/Metric_Datasets/H5/NP/NP_short_P.fasta"]
+#ParallelEvolution.creatematrix("H5",queryalignments)
+#ParallelEvolution.creatematrix("H5")
+#ParallelEvolution.simpleimputation("H5",queryalignments)
+#ParallelEvolution.simpleimputation("H5")
+#exit()
+#mappingsequence = "MNTQILAFIACMLIGTKGDKICLGHHAVANGTKVNTLTERGIEVVNATETVETVNIKKICTQGKRPTDLGQCGLLGTLIGPPQCDQFLEFDANLIIERREGTDVCYPGKFTNEESLRQILRGSGGIDKESMGFTYSGIRTNGATSACRRSGSSFYAEMKWLLSNSDNAAFPQMTKSYRNPRNKPALIIWGVHHSGSATEQTKLYGSGNKLITVGSSKYQQSFTPSPGARPQVNGQSGRIDFHWLLLDPNDTVTFTFNGAFIAPDRASFFRGESLGVQSDVPLDSGCEGDCFHSGGTIVSSLPFQNINPRTVGKCPRYVKQTSLLLATGMRNVPENPKRGLFGAIAGFIENGWEGLIDGWYGFRHQNAQGEGTAADYKSTQSAIDQITGKLNRLIDKTNQQFELIDNEFSEIEQQIGNVINWTRDSMTEVWSYNAELLVAMENQH-------------------------------------------------------------------------------------------------------------------"
+#ParallelEvolution.scoresequence(mappingsequence)
+#println(ParallelEvolution.marginaltraitprobability(1, 1, 0.01, 0.9))
+#using LinearAlgebra
+#Q,freqs = ParallelEvolution.getIndelTmatrix(0.5, 0.25, 1.0, 0.4, 10.0)
+#=
+println("DEL HP ", freqs[(1-1)*2 + 1])
+println("DEL LP ", freqs[(1-1)*2 + 2])
+println("INS HP ", freqs[(2-1)*2 + 1])
+println("INS LP ", freqs[(2-1)*2 + 2])
+println(Q)
+println(exp(Q*100.0))
+println(freqs)
+println(transpose(freqs)*Q)
+#println(ParallelEvolution.getLGmatrixwithdeletion(0.2, 2.0))
+=#
+#exit()
+
+parsed_args = ParallelEvolution.parse_commandline()
 if parsed_args["mlmodel"]
-    TraitEvolution.mlmodel()
-elseif parsed_args["bhattacharya"]
-    TraitEvolution.bhattacharya()
+    ParallelEvolution.mlmodel()
+elseif parsed_args["mlindelmodel"]
+    ParallelEvolution.mlindelmodel()
+elseif parsed_args["score"]
+    ParallelEvolution.score()
 elseif parsed_args["coevolution"]
-    TraitEvolution.coevolution()
+    ParallelEvolution.coevolution()
 elseif parsed_args["simulation"]
-    TraitEvolution.simulation()
+    ParallelEvolution.simulation()
 elseif parsed_args["processsimulations"]
-    TraitEvolution.processsimulations()
+    ParallelEvolution.processsimulations()
 else
-    TraitEvolution.mlmodel()
+    ParallelEvolution.bhattacharya()
 end

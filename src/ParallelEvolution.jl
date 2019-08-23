@@ -1070,7 +1070,7 @@ end
 function mlmodel(rng,fastafile,treefile,outfilename,annotations,maxcols=10000000000,prioritycolumns=Int[])
     parsed_args = parse_commandline()
     if outfilename == nothing
-        outfilename = string(fastafile,".results.update.csv")
+        outfilename = string(fastafile,".results.csv")
     end
     zup = 1
 
@@ -1093,7 +1093,7 @@ function mlmodel(rng,fastafile,treefile,outfilename,annotations,maxcols=10000000
         seqnametoindex[taxon] = seqindex
         seqindex += 1
     end
-    annotationnames = split(annotations,",")
+    annotationnames = reverse(split(annotations,","))
 
     traits = Int[]
     for name in names
@@ -1440,7 +1440,7 @@ function mlindelmodel(rng,fastafile,treefile,outfilename,annotations,maxcols=100
         seqnametoindex[taxon] = seqindex
         seqindex += 1
     end
-    annotationnames = split(annotations,",")
+    annotationnames = reverse(split(annotations,","))
 
     traits = Int[]
     for name in names
@@ -1622,7 +1622,7 @@ function score(rng,fastafile,treefile,outfilename,annotations,maxcols=1000000000
         seqnametoindex[taxon] = seqindex
         seqindex += 1
     end
-    annotationnames = split(annotations,",")
+    annotationnames = reverse(split(annotations,","))
 
     traits = Int[]
     for name in names
@@ -1939,7 +1939,7 @@ function mcmc()
         seqnametoindex[taxon] = seqindex
         seqindex += 1
     end
-    annotationnames = split(parsed_args["annotations"],",")
+    annotationnames = reverse(split(parsed_args["annotations"],","))
 
     traits = Int[]
     for name in names
